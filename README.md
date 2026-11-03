@@ -102,7 +102,7 @@ default to `timeout=600`. An explicit timeout overrides either default.
 
 The inline response threshold defaults to 2 MiB (maximum 4 MiB).
 The upstream response can total up to 512 MiB by default, separately bounded
-by `max_total_response_bytes`. Large bodies are cached in process memory, and
+by `max_total_response_bytes`. Large bodies are streamed to temporary files, credential-redacted, then cached in process memory, and
 `http_request` / `get_request` returns `paged=true` and `result_ref`.
 `read_result` pages by raw **byte offsets** with a 2 MiB default and
 4 MiB maximum requested byte count. Every complete serialized MCP page
@@ -114,7 +114,7 @@ without assuming a full requested page was returned. UTF-8 pages return text,
 binary pages return Base64; JSON fragments are not necessarily valid JSON.
 
 Result caching follows Flarith's process-local memory-pressure LRU:
-512 MiB maximum stored response; 896 MiB process RSS budget; oldest
+512 MiB hard response ceiling, subject to the 896 MiB process RSS admission budget; oldest
 inactive results are evicted only when memory reservation requires it.
 Short read leases prevent eviction during an individual page query.
 No TTL, external database, fixed entry count or cross-restart persistence.

@@ -207,3 +207,43 @@ async def test_mcp_read_result_contract_and_missing_reference(monkeypatch):
             "result_ref": "does-not-exist",
         })
         assert json.loads(missing.content[0].text)["error"] == "RESULT_NOT_FOUND"
+
+
+def test_512_mib_total_cap_and_compatibility():
+    from result_cache import MAX_STORED_BYTES
+    assert MAX_STORED_BYTES == 512 * MIB
+    assert server._limit(MAX_STORED_BYTES, "max_total_response_bytes", MAX_STORED_BYTES) == 512 * MIB
+    with pytest.raises(server.FreedoError):
+        server._limit(MAX_STORED_BYTES + 1, "max_total_response_bytes", MAX_STORED_BYTES)
+
+
+def test_streaming_redaction_handles_cross_block_boundaries(monkeypatch):
+    cache = fresh_cache(monkeypatch)
+    secret = "fake-access-secret-token"
+    monkeypatch.setenv("APIKEY_FAKE", json.dumps({"key": secret}))
+    block = b"x" * (MIB - 8) + secret.encode() + b"y" * (3 * MIB)
+    result = asyncio.run(server._execute_request(
+        method="GET", url="https://example.test",
+        headers={"Authorization": "Bearer {{env:APIKEY_FAKE}}"},
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, content=block, headers={"Content-Type": "text/plain"})),
+    ))
+    assert result["paged"]
+    with cache.borrow(result["result_ref"]) as entry:
+        assert secret.encode() not in entry.data
+        assert b"[REDACTED]" in entry.data
+        assert entry.data.startswith(b"x" * (MIB - 8))
+        assert entry.data.endswith(b"y" * (3 * MIB))
+
+
+def test_large_binary_is_paged_without_text_decoding(monkeypatch):
+    cache = fresh_cache(monkeypatch)
+    data = b"\xff" * (3 * MIB)
+    result = asyncio.run(server._execute_request(
+        method="GET", url="https://example.test",
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, content=data, headers={"Content-Type": "application/octet-stream"})),
+    ))
+    assert result["body_format"] == "base64" and result["paged"]
+    with cache.borrow(result["result_ref"]) as entry:
+        assert entry.data == data

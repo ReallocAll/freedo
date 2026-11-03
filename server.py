@@ -1,6 +1,7 @@
 """Freedo: a provider-agnostic HTTP API MCP for trusted agents."""
 
 import base64
+import codecs
 import json
 import tempfile
 from datetime import timedelta
@@ -203,7 +204,8 @@ def _page_payload(reference: str, data: bytes, body_format: str, offset: int,
         if headers is not None:
             payload["headers"] = headers
         if payload["size_limit_adjusted"]:
-            payload["size_limit_reason"] = "mcp_response_budget"
+            payload["size_limit_reason"] = ("mcp_response_budget" if count < requested
+                                            else "utf8_boundary")
         for _ in range(3):
             size = _framed_size(payload)
             if payload["mcp_response_bytes"] == size:
@@ -229,6 +231,65 @@ def _page_payload(reference: str, data: bytes, body_format: str, offset: int,
     if best is None:
         raise FreedoError("page cannot fit the MCP response budget")
     return best
+
+
+def _redact_stream(source, dest, used: set[str]) -> None:
+    """Bounded-memory credential replacement across read boundaries."""
+    values = set()
+    for secret in used:
+        values.add(secret.encode("utf-8"))
+        values.add(json.dumps(secret, ensure_ascii=True)[1:-1].encode("ascii"))
+    values.discard(b"")
+    if not values:
+        while chunk := source.read(1024 * 1024):
+            dest.write(chunk)
+        return
+    patterns = sorted(values, key=len, reverse=True)
+    matcher = re.compile(b"|".join(re.escape(pattern) for pattern in patterns))
+    overlap = max(map(len, patterns)) - 1
+    pending = b""
+    while chunk := source.read(1024 * 1024):
+        pending += chunk
+        safe = max(0, len(pending) - overlap)
+        consumed = 0
+        for match in matcher.finditer(pending):
+            if match.start() >= safe:
+                break
+            dest.write(pending[consumed:match.start()])
+            dest.write(b"[REDACTED]")
+            consumed = match.end()
+        if consumed < safe:
+            dest.write(pending[consumed:safe])
+            pending = pending[safe:]
+        else:
+            pending = pending[consumed:]
+    dest.write(matcher.sub(b"[REDACTED]", pending))
+
+
+def _materialize_paged(source, encoding: str, media_type: str,
+                       used: set[str]) -> tuple[str, bytes]:
+    """Redact and validate large responses without full-size intermediate copies."""
+    with tempfile.TemporaryFile() as clean:
+        source.seek(0)
+        _redact_stream(source, clean, used)
+        size = clean.tell()
+        if size > MAX_STORED_BYTES:
+            raise ResourceLimitError("redacted response exceeds maximum storage size")
+        clean.seek(0)
+        body_format = "base64"
+        if encoding.lower().replace("_", "-") in ("utf-8", "utf8", "utf-8-sig"):
+            try:
+                decoder = codecs.getincrementaldecoder(encoding)("strict")
+                while chunk := clean.read(1024 * 1024):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+                body_format = ("json" if media_type == "application/json"
+                               or media_type.endswith("+json") else "text")
+            except (UnicodeError, LookupError):
+                pass
+        RESULTS.reserve(size + 16 * 1024 * 1024)
+        clean.seek(0)
+        return body_format, clean.read()
 
 
 async def _execute_request(
@@ -308,17 +369,18 @@ async def _execute_request(
                             }
                         output.write(chunk)
 
-                    # Reserve before materializing the buffered response, not afterwards.
+                    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                     if size > response_limit:
-                        RESULTS.reserve(3 * size + 16 * 1024 * 1024)
-                    output.seek(0)
-                    body = output.read()
-
-                media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                body_format, safe_bytes, value = _safe_body(
-                    body, response.encoding or "utf-8", media_type, used,
-                    parse_json=size <= response_limit
-                )
+                        body_format, safe_bytes = _materialize_paged(
+                            output, response.encoding or "utf-8", media_type, used
+                        )
+                        value = None
+                    else:
+                        output.seek(0)
+                        body_format, safe_bytes, value = _safe_body(
+                            output.read(), response.encoding or "utf-8", media_type,
+                            used, parse_json=True
+                        )
                 safe_headers = (_redact(dict(response.headers), used)
                                 if include_response_headers else None)
 
