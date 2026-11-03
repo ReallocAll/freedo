@@ -134,6 +134,8 @@ async def test_auto_detaches_same_request_without_retry(monkeypatch):
         })
         payload = json.loads(first.content[0].text)
         assert payload["status"] == "working" and payload["task_id"]
+        assert payload["origin_instance_id"] == server.INSTANCE_ID
+        assert payload["docket_backend"] == server.DOCKET_BACKEND
         pending = await client.call_tool("get_request", {"task_id": payload["task_id"]})
         assert json.loads(pending.content[0].text)["status"] == "working"
         gate.set()
@@ -247,3 +249,25 @@ def test_large_binary_is_paged_without_text_decoding(monkeypatch):
     assert result["body_format"] == "base64" and result["paged"]
     with cache.borrow(result["result_ref"]) as entry:
         assert entry.data == data
+
+
+@pytest.mark.asyncio
+async def test_missing_background_task_has_bounded_recovery_guidance():
+    async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
+        missing = await client.call_tool("get_request", {
+            "task_id": "unknown-task-id",
+        })
+    result = json.loads(missing.content[0].text)
+    assert result["error"] == "TASK_NOT_FOUND"
+    assert result["task_id"] == "unknown-task-id"
+    assert result["status"] == "unknown" and result["outcome_unknown"] is True
+    assert result["serving_instance_id"] == server.INSTANCE_ID
+    assert result["docket_backend"] == server.DOCKET_BACKEND
+    if server.DOCKET_BACKEND == "memory":
+        assert "not shared between Horizon instances" in result["message"]
+    assert result["retry_after_seconds"] == 5
+    assert result["max_additional_polls"] == 2
+    assert result["do_not_resubmit_automatically"] is True
+    assert "STOP polling" in result["next_action"]
+    assert "UNKNOWN" in result["next_action"]
+    assert "may still have executed" in result["message"]

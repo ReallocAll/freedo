@@ -119,10 +119,44 @@ inactive results are evicted only when memory reservation requires it.
 Short read leases prevent eviction during an individual page query.
 No TTL, external database, fixed entry count or cross-restart persistence.
 A lost result returns `RESULT_NOT_FOUND` and must not trigger automatic
-replay of POST/DELETE. Task IDs are likewise process-local; completed task
-results are consumed by the first successful `get_request`.
+replay of POST/DELETE. By default, Docket task IDs are also process-local;
+completed task results are consumed by the first successful `get_request`.
 
-Background HTTP is submitted to the FastMCP Tasks extension Docket worker from the start, and `get_request` polls Docket execution state independently of MCP Tasks client capability negotiation. The default in-memory Docket backend and the response cache are **process-local**; restart or scale-out can lose tasks/results. Horizon end-to-end verification is required before relying on long-running requests in production.
+### Task visibility across Horizon instances
+
+Horizon may start, stop, or route requests between different Freedo server
+processes **without creating a new Deployment**. The default Docket backend,
+`memory://`, cannot share tasks between those processes. A task may therefore
+return `working`, then `TASK_NOT_FOUND`, and sometimes `working` again.
+This behavior was observed during a long-running Ark conversation experiment.
+
+For reliable task **lookup across processes**, configure a shared Redis/Valkey
+backend using FastMCP's built-in setting; no custom Freedo queue is needed.
+Add a Horizon Production environment variable (not an `APIKEY_*` credential):
+
+```text
+FASTMCP_DOCKET_URL=rediss://USER:PASSWORD@REDIS_HOST:PORT/0
+```
+
+Use an actual Redis/Valkey connection string supplied by your provider.
+Keep it secret: it contains credentials. Every Freedo instance must use the
+same URL (and Docket queue name). Redis makes task state shared, but does not
+guarantee exactly-once execution after a worker crash: never automatically
+replay non-idempotent HTTP requests. The **large-response cache is still
+process-local**, so Redis does not yet solve cross-instance
+`RESULT_NOT_FOUND` for paged bodies.
+
+For background requests, Freedo now returns `origin_instance_id` and
+`docket_backend`. `get_request` reports the serving instance, and
+`TASK_NOT_FOUND` includes `status="unknown"`, its backend and process
+diagnostics, `retry_after_seconds=5`, `max_additional_polls=2`,
+`do_not_resubmit_automatically=true`, and a `next_action` message.
+**This error does not mean the upstream HTTP request failed.** Try the same
+task ID at most twice more with 5-second intervals. If it remains missing,
+stop polling and report an unknown outcome; do not resubmit the HTTP POST
+without independent verification or user approval.
+
+Background HTTP is submitted to the FastMCP Tasks extension Docket worker from the start, and `get_request` polls Docket execution state independently of MCP Tasks client capability negotiation. Without a shared Redis/Valkey backend, Docket state is **process-local** and unsuitable for reliable long-running Horizon tasks, even when occasional long requests complete successfully. See the configuration above.
 
 ## Deploy to Horizon
 
@@ -140,4 +174,4 @@ python mcp_server.py
 
 Local tests: `python -m pip install -e ".[test]" && python -m pytest -q`.
 
-**Current scope:** generic HTTP APIs, process-local long requests and paged responses. No OAuth lifecycle management, HMAC/SigV4 signer, external persistence, retries or multi-host workers.
+**Current scope:** generic HTTP APIs, background HTTP with built-in optional Docket Redis/Valkey state sharing, and process-local paged responses. No OAuth lifecycle management, HMAC/SigV4 signer, automatic HTTP replay or distributed result-cache storage.
