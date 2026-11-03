@@ -128,7 +128,7 @@ async def test_auto_detaches_same_request_without_retry(monkeypatch):
         return {"status_code": 202, "body": {"done": True}, "body_format": "json",
                 "size_bytes": 13}
     monkeypatch.setattr(server, "_execute_request", fake_execute)
-    async with Client(server.mcp, mode="legacy") as client:
+    async with Client(server.mcp) as client:
         first = await client.call_tool("http_request", {
             "method": "POST", "url": "https://example.test", "execution": "auto",
         })
@@ -150,7 +150,7 @@ async def test_direct_is_inline_with_60_second_timeout(monkeypatch):
         return {"status_code": 200, "body": "ok", "body_format": "text",
                 "size_bytes": 2}
     monkeypatch.setattr(server, "_execute_request", fake_execute)
-    async with Client(server.mcp, mode="legacy") as client:
+    async with Client(server.mcp) as client:
         result = await client.call_tool("http_request", {
             "method": "GET", "url": "https://example.test", "execution": "direct",
         })
@@ -191,7 +191,7 @@ async def test_mcp_read_result_contract_and_missing_reference(monkeypatch):
     cache = fresh_cache(monkeypatch)
     data = b"\\\"\n" * (2 * MIB)
     ref = cache.put(data, "text", 200, len(data), None)
-    async with Client(server.mcp, mode="legacy") as client:
+    async with Client(server.mcp) as client:
         response = await client.call_tool("read_result", {
             "result_ref": ref, "limit_bytes": 4 * MIB,
         })
