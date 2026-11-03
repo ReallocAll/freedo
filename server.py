@@ -165,7 +165,8 @@ def _paged_result(status_code: int, size_bytes: int, body_format: str,
 
 
 def _page_payload(reference: str, data: bytes, body_format: str, offset: int,
-                  limit: int) -> dict[str, Any]:
+                  limit: int, status_code: int, source_size_bytes: int,
+                  headers: dict[str, str] | None) -> dict[str, Any]:
     remaining = len(data) - offset
     requested = min(limit, remaining)
 
@@ -195,7 +196,12 @@ def _page_payload(reference: str, data: bytes, body_format: str, offset: int,
             "has_more": offset + actual < len(data),
             "next_offset": offset + actual if offset + actual < len(data) else None,
             "mcp_response_bytes": 0,
+            "body_format": body_format,
+            "status_code": status_code,
+            "source_size_bytes": source_size_bytes,
         }
+        if headers is not None:
+            payload["headers"] = headers
         if payload["size_limit_adjusted"]:
             payload["size_limit_reason"] = "mcp_response_budget"
         for _ in range(3):
@@ -448,16 +454,10 @@ def read_result(result_ref: str, offset: int = 0,
         with RESULTS.borrow(result_ref) as item:
             if offset > len(item.data):
                 raise FreedoError("offset exceeds cached result size")
-            page = _page_payload(result_ref, item.data, item.body_format, offset, limit_bytes)
-            page["body_format"] = item.body_format
-            page["status_code"] = item.status_code
-            page["source_size_bytes"] = item.size_bytes
-            if item.headers is not None:
-                page["headers"] = item.headers
-            # Budget includes final metadata as well as the page.
-            if _framed_size(page) >= MAX_PAGE_RESPONSE_BYTES - 4096:
-                raise FreedoError("page metadata exceeds response budget")
-            page["mcp_response_bytes"] = _framed_size(page)
+            page = _page_payload(
+                result_ref, item.data, item.body_format, offset, limit_bytes,
+                item.status_code, item.size_bytes, item.headers
+            )
             return ToolResult(content=_format_result(page))
     except ResultNotFoundError:
         return ToolResult(content=_format_result({"error": "RESULT_NOT_FOUND"}))

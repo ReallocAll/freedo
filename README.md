@@ -52,7 +52,9 @@ Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and
 ## Tools
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
-- `http_request(method, url, ...)` sends arbitrary HTTP requests. The agent decides which provider, endpoint, parameters and authentication scheme to use.
+- `http_request(method, url, ...)` sends arbitrary HTTP requests and supports `execution="auto"|"direct"|"background"`.
+- `get_request(task_id)` polls background HTTP requests. Completed tasks return their result once and are released.
+- `read_result(result_ref, offset=0, limit_bytes=2097152)` reads cached large response bodies.
 
 Use a credential reference anywhere in a string value (including nested JSON values):
 
@@ -89,6 +91,43 @@ HTTP 4xx/5xx status codes are returned as normal HTTP results, not MCP failures.
 
 **Trust boundary:** This is a private, powerful HTTP executor. An authorized agent can choose arbitrary network destinations and attach configured credentials. Enable Horizon's managed authentication and connect only trusted agents. Freedo does not constrain provider hosts, inspect API permissions, or add confirmation workflows.
 
+## Long requests and large bodies (v0.3.0)
+
+`execution="auto"` starts the HTTP request once, waits up to 15 seconds,
+and returns a `task_id` if still running. The HTTP request continues
+within the Horizon server process; it is **not** reissued. `direct`
+always awaits the result, while `background` immediately returns a task ID.
+Direct requests default to HTTPX `timeout=60`; automatic/background requests
+default to `timeout=600`. An explicit timeout overrides either default.
+
+The inline response threshold defaults to 2 MiB (maximum 4 MiB).
+The upstream response can total up to 128 MiB by default, separately bounded
+by `max_total_response_bytes`. Large bodies are cached in process memory, and
+`http_request` / `get_request` returns `paged=true` and `result_ref`.
+`read_result` pages by raw **byte offsets** with a 2 MiB default and
+4 MiB maximum requested byte count. Every complete serialized MCP page
+is strictly below 4 MiB, with a framing allowance. Pages automatically shrink
+when Base64 or JSON escaping expands the wire size. The response includes
+`requested_bytes`, `returned_bytes`, `mcp_response_bytes`,
+`size_limit_adjusted`, `has_more`, and `next_offset`. Use `next_offset`
+without assuming a full requested page was returned. UTF-8 pages return text,
+binary pages return Base64; JSON fragments are not necessarily valid JSON.
+
+Result caching follows Flarith's process-local memory-pressure LRU:
+128 MiB maximum stored response; 896 MiB process RSS budget; oldest
+inactive results are evicted only when memory reservation requires it.
+Short read leases prevent eviction during an individual page query.
+No TTL, external database, fixed entry count or cross-restart persistence.
+A lost result returns `RESULT_NOT_FOUND` and must not trigger automatic
+replay of POST/DELETE. Task IDs are likewise process-local; completed task
+results are consumed by the first successful `get_request`.
+
+Unlike native MCP Tasks, this version exposes polling through `get_request`
+so clients need no protocol extension negotiation. Its task execution relies
+on the hosting process continuing after the original MCP tool call; **Horizon
+end-to-end verification is required** before relying on it for production
+requests lasting more than the original request window.
+
 ## Deploy to Horizon
 
 1. Connect this repository at https://horizon.prefect.io.
@@ -105,4 +144,4 @@ python mcp_server.py
 
 Local tests: `python -m pip install -e ".[test]" && python -m pytest -q`.
 
-**Current scope:** conventional HTTP APIs, including REST, GraphQL and non-streaming model inference. No OAuth lifecycle management, HMAC/SigV4 signer, file-upload protocol, persistence, retries or long-running agent runtime.
+**Current scope:** generic HTTP APIs, process-local long requests and paged responses. No OAuth lifecycle management, HMAC/SigV4 signer, external persistence, retries or multi-host workers.

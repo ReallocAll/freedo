@@ -87,8 +87,9 @@ def test_body_limits_and_no_truncated_response():
     assert not calls
 
     rejected = run(method="GET", url="https://example.test", transport=transport)
-    assert rejected["error"] == "response_too_large"
-    assert "body" not in rejected
+    assert rejected["paged"] is True
+    assert rejected["size_bytes"] == DEFAULT_LIMIT + 1
+    assert "result_ref" in rejected
 
     accepted = run(method="GET", url="https://example.test", transport=transport,
                    max_response_bytes=MAX_LIMIT)
@@ -135,9 +136,9 @@ def test_mcp_tools_registered():
     async def check():
         async with Client(mcp, mode="legacy") as client:
             assert client.server_info.name == "Freedo"
-            assert client.server_info.version == version("freedo") == "0.2.0"
+            assert client.server_info.version == version("freedo") == "0.3.0"
             names = {tool.name for tool in await client.list_tools()}
-            assert names == {"list_env", "http_request"}
+            assert names == {"list_env", "http_request", "get_request", "read_result"}
             response = await client.call_tool("list_env", {})
             assert not response.is_error
             result = await client.call_tool("http_request", {
