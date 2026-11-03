@@ -3,6 +3,7 @@
 import base64
 import codecs
 import json
+import logging
 import tempfile
 from contextlib import nullcontext
 from datetime import timedelta
@@ -10,6 +11,7 @@ from importlib.metadata import version
 import os
 import re
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from fastmcp import FastMCP
@@ -30,6 +32,10 @@ DEFAULT_PAGE_BYTES = 2 * 1024 * 1024
 AUTO_FOREGROUND_SECONDS = 15
 RESULTS = ResultCache()
 REFERENCE = re.compile(r"\{\{env:(APIKEY_[A-Za-z0-9_]+)\}\}")
+LOGGER = logging.getLogger("freedo.tasks")
+INSTANCE_ID = uuid4().hex[:12]
+# Report the backend scheme only; never expose a Redis URL or password.
+DOCKET_BACKEND = os.environ.get("FASTMCP_DOCKET_URL", "memory://").split(":", 1)[0]
 
 
 class FreedoError(ValueError):
@@ -483,6 +489,8 @@ async def http_request(
         return ToolResult(content=_format_result({"error": "background_schedule_failed"}))
 
     task_id = execution_ref.key
+    LOGGER.info("task_scheduled task_id=%s instance=%s backend=%s",
+                task_id, INSTANCE_ID, DOCKET_BACKEND)
     if execution == "auto":
         try:
             # Waiting does not cancel or resubmit the scheduled Docket execution.
@@ -495,11 +503,21 @@ async def http_request(
         except Exception:
             return ToolResult(content=_format_result({
                 "error": "background_execution_failed", "task_id": task_id,
+                "origin_instance_id": INSTANCE_ID, "docket_backend": DOCKET_BACKEND,
+                "outcome_unknown": True,
+                "next_action": "Inspect the task with get_request; do not automatically replay the HTTP request.",
             }))
-    return ToolResult(content=_format_result({
+    payload = {
         "task_id": task_id, "status": "working", "poll_tool": "get_request",
         "poll_interval_seconds": 5,
-    }))
+        "origin_instance_id": INSTANCE_ID, "docket_backend": DOCKET_BACKEND,
+    }
+    if DOCKET_BACKEND == "memory":
+        payload["warning"] = (
+            "This task is stored in process-local memory. Horizon may route later polls "
+            "to another process; use shared Redis/Valkey via FASTMCP_DOCKET_URL for reliable task lookup."
+        )
+    return ToolResult(content=_format_result(payload))
 
 
 async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
@@ -509,33 +527,72 @@ async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_request(task_id: str) -> ToolResult:
-    """Poll a Docket HTTP execution; results remain readable while retained."""
+    """Poll a Docket HTTP execution; TASK_NOT_FOUND means unknown outcome, not failure."""
     docket = mcp.docket
     if docket is None:
-        return ToolResult(content=_format_result({"error": "background_unavailable"}))
+        return ToolResult(content=_format_result({
+            "error": "background_unavailable", "task_id": task_id,
+            "next_action": "Stop polling: the background task service is unavailable.",
+        }))
     try:
         execution_ref = await docket.get_execution(task_id)
-    except Exception:
-        return ToolResult(content=_format_result({"error": "background_lookup_failed"}))
+    except Exception as exc:
+        LOGGER.warning("task_lookup_failed task_id=%s instance=%s error_type=%s",
+                       task_id, INSTANCE_ID, type(exc).__name__)
+        return ToolResult(content=_format_result({
+            "error": "background_lookup_failed", "task_id": task_id,
+            "error_type": type(exc).__name__, "status": "unknown",
+            "serving_instance_id": INSTANCE_ID,
+            "next_action": "Retry the same task ID briefly; if lookups still fail, stop and report an unknown outcome. Do not replay the original request automatically.",
+        }))
     if execution_ref is None:
-        return ToolResult(content=_format_result({"error": "TASK_NOT_FOUND"}))
+        LOGGER.warning("task_not_found task_id=%s instance=%s backend=%s",
+                       task_id, INSTANCE_ID, DOCKET_BACKEND)
+        message = (
+            "This process has no record of the task. In-memory Docket state is not "
+            "shared between Horizon instances and is lost on process shutdown."
+            if DOCKET_BACKEND == "memory" else
+            "The configured Docket backend has no record of this task; it may be "
+            "invalid, expired, or removed."
+        )
+        return ToolResult(content=_format_result({
+            "error": "TASK_NOT_FOUND", "task_id": task_id,
+            "status": "unknown", "outcome_unknown": True,
+            "serving_instance_id": INSTANCE_ID, "docket_backend": DOCKET_BACKEND,
+            "message": message + " The upstream HTTP request may still have executed.",
+            "retry_after_seconds": 5, "max_additional_polls": 2,
+            "do_not_resubmit_automatically": True,
+            "next_action": (
+                "Retry get_request with this SAME task_id at most twice, at least 5 seconds "
+                "apart. If still missing, STOP polling and report the original HTTP outcome "
+                "as UNKNOWN. Never re-send a potentially non-idempotent request without "
+                "checking upstream state or obtaining user approval."
+            ),
+        }))
     status = execution_ref.state.value
     if status in ("scheduled", "queued", "running"):
         return ToolResult(content=_format_result({
-            "task_id": task_id, "status": "working",
+            "task_id": task_id, "status": "working", "docket_state": status,
+            "serving_instance_id": INSTANCE_ID, "poll_interval_seconds": 5,
         }))
     if status != "completed":
         return ToolResult(content=_format_result({
-            "task_id": task_id, "status": "failed",
+            "task_id": task_id, "status": "failed", "docket_state": status,
+            "serving_instance_id": INSTANCE_ID,
         }))
     try:
         result = await execution_ref.get_result()
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("task_result_failed task_id=%s instance=%s error_type=%s",
+                       task_id, INSTANCE_ID, type(exc).__name__)
         return ToolResult(content=_format_result({
             "task_id": task_id, "status": "failed",
+            "error": "background_result_unavailable", "error_type": type(exc).__name__,
+            "serving_instance_id": INSTANCE_ID,
         }))
     return ToolResult(content=_format_result({
         "task_id": task_id, "status": "completed", "result": result,
+        "serving_instance_id": INSTANCE_ID,
     }))
 
 @mcp.tool()
