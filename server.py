@@ -4,6 +4,7 @@ import base64
 import codecs
 import json
 import tempfile
+from contextlib import nullcontext
 from datetime import timedelta
 from importlib.metadata import version
 import os
@@ -269,9 +270,12 @@ def _redact_stream(source, dest, used: set[str]) -> None:
 def _materialize_paged(source, encoding: str, media_type: str,
                        used: set[str]) -> tuple[str, bytes]:
     """Redact and validate large responses without full-size intermediate copies."""
-    with tempfile.TemporaryFile() as clean:
+    # Avoid a second full-size disk copy when no credential needs redaction.
+    with (tempfile.TemporaryFile() if used else nullcontext(source)) as clean:
         source.seek(0)
-        _redact_stream(source, clean, used)
+        if used:
+            _redact_stream(source, clean, used)
+        clean.seek(0, 2)
         size = clean.tell()
         if size > MAX_STORED_BYTES:
             raise ResourceLimitError("redacted response exceeds maximum storage size")
