@@ -129,6 +129,7 @@ async def _execute_request(
                 raise FreedoError("basic_auth requires username/password and no Authorization header")
             raw = f"{auth['username']}:{auth['password']}".encode("utf-8")
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+            used.add(headers["Authorization"])
 
         body_kwargs: dict[str, Any] = {}
         if json_body is not None:

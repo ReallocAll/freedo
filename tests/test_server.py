@@ -56,7 +56,7 @@ def test_basic_auth_and_form(monkeypatch):
         value = request.headers["authorization"].removeprefix("Basic ")
         assert base64.b64decode(value).decode() == "user:password123"
         assert request.content == b"name=hello+world"
-        return httpx.Response(204)
+        return httpx.Response(200, json={"authorization": request.headers["authorization"]})
 
     result = run(
         method="POST", url="https://example.test",
@@ -64,7 +64,9 @@ def test_basic_auth_and_form(monkeypatch):
         form_body={"name": "hello world"},
         transport=httpx.MockTransport(handle),
     )
-    assert result["status_code"] == 204
+    assert result["status_code"] == 200
+    assert "[REDACTED]" in result["body"]
+    assert "cGFzc3dvcmQxMjM=" not in result["body"]
 
 
 def test_body_limits_and_no_truncated_response():
