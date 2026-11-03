@@ -162,3 +162,48 @@ async def test_direct_is_inline_with_60_second_timeout(monkeypatch):
         done = await _poll_until_done(client, task_id)
         assert done["result"]["status_code"] == 200
     assert called == [60, 600]
+
+
+def test_echoed_credential_is_redacted_before_paging(monkeypatch):
+    cache = fresh_cache(monkeypatch)
+    secret = "test-secret-value"
+    monkeypatch.setenv("APIKEY_SAMPLE", json.dumps({"key": secret}))
+    # The secret straddles the 2 MiB default page boundary.
+    response = b"a" * (2 * MIB - 7) + secret.encode() + b"z" * 1024
+    result = asyncio.run(server._execute_request(
+        method="GET", url="https://example.test",
+        headers={"Authorization": "Bearer {{env:APIKEY_SAMPLE}}"},
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            200, content=response, headers={"Content-Type": "text/plain"})),
+    ))
+    assert result["paged"] and result["size_bytes"] == len(response)
+    with cache.borrow(result["result_ref"]) as entry:
+        assert secret.encode() not in entry.data
+        assert b"[REDACTED]" in entry.data
+        page = server._page_payload(result["result_ref"], entry.data,
+            entry.body_format, 0, 2 * MIB, entry.status_code, entry.size_bytes, None)
+        assert page["mcp_response_bytes"] < 4 * MIB
+        assert secret not in page["data"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_read_result_contract_and_missing_reference(monkeypatch):
+    cache = fresh_cache(monkeypatch)
+    data = b"\\\"\n" * (2 * MIB)
+    ref = cache.put(data, "text", 200, len(data), None)
+    async with Client(server.mcp, mode="legacy") as client:
+        response = await client.call_tool("read_result", {
+            "result_ref": ref, "limit_bytes": 4 * MIB,
+        })
+        assert not response.is_error
+        assert response.structured_content is None
+        assert len(response.content) == 1
+        result = json.loads(response.content[0].text)
+        assert result["size_limit_adjusted"]
+        assert result["mcp_response_bytes"] < 4 * MIB
+        assert server._framed_size(result) == result["mcp_response_bytes"]
+        assert result["returned_bytes"] > 0
+        missing = await client.call_tool("read_result", {
+            "result_ref": "does-not-exist",
+        })
+        assert json.loads(missing.content[0].text)["error"] == "RESULT_NOT_FOUND"

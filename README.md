@@ -66,9 +66,9 @@ Use a credential reference anywhere in a string value (including nested JSON val
 }
 ```
 
-Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
+Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
-Each request and response body defaults to 2 MiB (2,097,152 bytes); both limits can be increased independently up to 4 MiB (4,194,304 bytes). Request size is calculated *after* credential substitution and encoding. If a response exceeds the selected limit, Freedo stops reading it and returns an error rather than a partial body. Binary response bodies are base64 encoded. Unusually escape-heavy output may hit the Horizon MCP envelope limit even if the raw HTTP body fits; the tool returns an explicit error.
+Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 128 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
 
 ### Response format (v0.2.0)
 
