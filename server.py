@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.tools import ToolResult
 
 mcp = FastMCP("Freedo", version=version("freedo"))
 
@@ -209,7 +210,7 @@ async def http_request(
     timeout: float = 60,
     max_request_bytes: int = DEFAULT_LIMIT,
     max_response_bytes: int = DEFAULT_LIMIT,
-) -> str:
+) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
 
     Consult list_env to discover configured credentials. Construct service-specific
@@ -225,5 +226,5 @@ async def http_request(
         method, url, headers, params, json_body, text_body, form_body,
         body_base64, basic_auth, timeout, max_request_bytes, max_response_bytes
     )
-    return _format_result(result)
+    return ToolResult(content=_format_result(result))
 

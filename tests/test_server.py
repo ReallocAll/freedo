@@ -132,11 +132,19 @@ def test_mcp_tools_registered():
     async def check():
         async with Client(mcp, mode="legacy") as client:
             assert client.server_info.name == "Freedo"
-            assert client.server_info.version == version("freedo") == "0.1.0"
+            assert client.server_info.version == version("freedo") == "0.1.1"
             names = {tool.name for tool in await client.list_tools()}
             assert names == {"list_env", "http_request"}
             response = await client.call_tool("list_env", {})
             assert not response.is_error
+            result = await client.call_tool("http_request", {
+                "method": "GET", "url": "https://example.test",
+                "max_response_bytes": 0,
+            })
+            assert not result.is_error
+            assert result.structured_content is None
+            assert len(result.content) == 1
+            assert json.loads(result.content[0].text)["error"] == "invalid_request"
 
     asyncio.run(check())
 
