@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "Provider-agnostic HTTP API MCP for trusted agents"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp==4.1.6",
+    "fastmcp[tasks]==4.1.6",
     "httpx==0.28.1",
 ]
 

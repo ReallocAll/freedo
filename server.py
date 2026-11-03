@@ -1,10 +1,9 @@
 """Freedo: a provider-agnostic HTTP API MCP for trusted agents."""
 
-import asyncio
 import base64
 import json
-import secrets
 import tempfile
+from datetime import timedelta
 from importlib.metadata import version
 import os
 import re
@@ -13,10 +12,12 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
+from fastmcp_tasks import TasksExtension
 
 from result_cache import MAX_STORED_BYTES, ResultCache, ResultNotFoundError, ResourceLimitError
 
 mcp = FastMCP("Freedo", version=version("freedo"))
+mcp.add_extension(TasksExtension())
 
 DEFAULT_LIMIT = 2 * 1024 * 1024
 MAX_LIMIT = 4 * 1024 * 1024
@@ -26,7 +27,6 @@ MAX_PAGE_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_PAGE_BYTES = 2 * 1024 * 1024
 AUTO_FOREGROUND_SECONDS = 15
 RESULTS = ResultCache()
-_JOBS: dict[str, asyncio.Task[dict[str, Any]]] = {}
 REFERENCE = re.compile(r"\{\{env:(APIKEY_[A-Za-z0-9_]+)\}\}")
 
 
@@ -389,10 +389,10 @@ async def http_request(
     to return headers for pagination, redirects, caching, or diagnostics.
     HTTP 4xx/5xx are returned normally; redirects are never followed.
     Request bodies have a 2-4 MiB limit. The response inline limit is 2-4 MiB;
-    larger bodies up to max_total_response_bytes (128 MiB default) are cached
+    larger bodies up to max_total_response_bytes (512 MiB default) are cached
     for read_result pagination. execution is auto (15s front window), direct,
     or background. Direct defaults to 60s HTTP timeout; auto/background to 600s.
-    Poll background task IDs with get_request. Jobs and results are process-local.
+    Poll background task IDs with get_request. Docket and result cache are process-local.
     """
     if execution not in ("auto", "direct", "background"):
         return ToolResult(content=_format_result({
@@ -400,48 +400,77 @@ async def http_request(
             "detail": "execution must be auto, direct or background"
         }))
     effective_timeout = (60 if execution == "direct" else 600) if timeout is None else timeout
-    coro = _execute_request(
+    arguments = (
         method, url, headers, params, json_body, text_body, form_body,
         body_base64, basic_auth, effective_timeout, max_request_bytes,
-        max_response_bytes, include_response_headers, max_total_response_bytes
+        max_response_bytes, include_response_headers, max_total_response_bytes,
     )
     if execution == "direct":
-        return ToolResult(content=_format_result(await coro))
+        return ToolResult(content=_format_result(await _execute_request(*arguments)))
 
-    job = asyncio.create_task(coro)
+    docket = mcp.docket
+    if docket is None:
+        return ToolResult(content=_format_result({"error": "background_unavailable"}))
+    try:
+        execution_ref = await docket.add(_run_background_http)(arguments)
+    except Exception:
+        return ToolResult(content=_format_result({"error": "background_schedule_failed"}))
+
+    task_id = execution_ref.key
     if execution == "auto":
         try:
-            result = await asyncio.wait_for(asyncio.shield(job), AUTO_FOREGROUND_SECONDS)
+            # Waiting does not cancel or resubmit the scheduled Docket execution.
+            result = await execution_ref.get_result(
+                timeout=timedelta(seconds=AUTO_FOREGROUND_SECONDS)
+            )
             return ToolResult(content=_format_result(result))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
-    task_id = secrets.token_urlsafe(18)
-    _JOBS[task_id] = job
+        except Exception:
+            return ToolResult(content=_format_result({
+                "error": "background_execution_failed", "task_id": task_id,
+            }))
     return ToolResult(content=_format_result({
         "task_id": task_id, "status": "working", "poll_tool": "get_request",
         "poll_interval_seconds": 5,
     }))
 
 
+async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
+    """Docket worker entrypoint; credentials are resolved only during execution."""
+    return await _execute_request(*arguments)
+
+
 @mcp.tool()
-def get_request(task_id: str) -> ToolResult:
-    """Poll a running HTTP request by task_id; terminal results are consumed once."""
-    job = _JOBS.get(task_id)
-    if job is None:
-        return ToolResult(content=_format_result({"error": "TASK_NOT_FOUND"}))
-    if not job.done():
-        return ToolResult(content=_format_result({"task_id": task_id, "status": "working"}))
-    _JOBS.pop(task_id, None)
-    if job.cancelled():
-        return ToolResult(content=_format_result({"task_id": task_id, "status": "failed"}))
+async def get_request(task_id: str) -> ToolResult:
+    """Poll a Docket HTTP execution; results remain readable while retained."""
+    docket = mcp.docket
+    if docket is None:
+        return ToolResult(content=_format_result({"error": "background_unavailable"}))
     try:
-        result = job.result()
+        execution_ref = await docket.get_execution(task_id)
     except Exception:
-        result = {"error": "http_error", "type": "BackgroundExecutionError"}
+        return ToolResult(content=_format_result({"error": "background_lookup_failed"}))
+    if execution_ref is None:
+        return ToolResult(content=_format_result({"error": "TASK_NOT_FOUND"}))
+    status = execution_ref.state.value
+    if status in ("scheduled", "queued", "running"):
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "working",
+        }))
+    if status != "completed":
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "failed",
+        }))
+    try:
+        result = await execution_ref.get_result()
+    except Exception:
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "failed",
+        }))
     return ToolResult(content=_format_result({
         "task_id": task_id, "status": "completed", "result": result,
     }))
-
 
 @mcp.tool()
 def read_result(result_ref: str, offset: int = 0,

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator
 
 MIB = 1024 * 1024
-MAX_STORED_BYTES = 128 * MIB
+MAX_STORED_BYTES = 512 * MIB
 MAX_PROCESS_RSS = 896 * MIB
 
 

@@ -53,7 +53,7 @@ Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
 - `http_request(method, url, ...)` sends arbitrary HTTP requests and supports `execution="auto"|"direct"|"background"`.
-- `get_request(task_id)` polls background HTTP requests. Completed tasks return their result once and are released.
+- `get_request(task_id)` polls background HTTP requests. Completed tasks return their result while retained by Docket.
 - `read_result(result_ref, offset=0, limit_bytes=2097152)` reads cached large response bodies.
 
 Use a credential reference anywhere in a string value (including nested JSON values):
@@ -68,7 +68,7 @@ Use a credential reference anywhere in a string value (including nested JSON val
 
 Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
-Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 128 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
+Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 512 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
 
 ### Response format (v0.2.0)
 
@@ -101,7 +101,7 @@ Direct requests default to HTTPX `timeout=60`; automatic/background requests
 default to `timeout=600`. An explicit timeout overrides either default.
 
 The inline response threshold defaults to 2 MiB (maximum 4 MiB).
-The upstream response can total up to 128 MiB by default, separately bounded
+The upstream response can total up to 512 MiB by default, separately bounded
 by `max_total_response_bytes`. Large bodies are cached in process memory, and
 `http_request` / `get_request` returns `paged=true` and `result_ref`.
 `read_result` pages by raw **byte offsets** with a 2 MiB default and
@@ -114,7 +114,7 @@ without assuming a full requested page was returned. UTF-8 pages return text,
 binary pages return Base64; JSON fragments are not necessarily valid JSON.
 
 Result caching follows Flarith's process-local memory-pressure LRU:
-128 MiB maximum stored response; 896 MiB process RSS budget; oldest
+512 MiB maximum stored response; 896 MiB process RSS budget; oldest
 inactive results are evicted only when memory reservation requires it.
 Short read leases prevent eviction during an individual page query.
 No TTL, external database, fixed entry count or cross-restart persistence.
@@ -122,11 +122,7 @@ A lost result returns `RESULT_NOT_FOUND` and must not trigger automatic
 replay of POST/DELETE. Task IDs are likewise process-local; completed task
 results are consumed by the first successful `get_request`.
 
-Unlike native MCP Tasks, this version exposes polling through `get_request`
-so clients need no protocol extension negotiation. Its task execution relies
-on the hosting process continuing after the original MCP tool call; **Horizon
-end-to-end verification is required** before relying on it for production
-requests lasting more than the original request window.
+Background HTTP is submitted to the FastMCP Tasks extension Docket worker from the start, and `get_request` polls Docket execution state independently of MCP Tasks client capability negotiation. The default in-memory Docket backend and the response cache are **process-local**; restart or scale-out can lose tasks/results. Horizon end-to-end verification is required before relying on long-running requests in production.
 
 ## Deploy to Horizon
 
