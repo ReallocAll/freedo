@@ -47,9 +47,10 @@ def test_http_request_and_nested_credential_injection(monkeypatch):
     )
     assert len(observed) == 1
     assert result["status_code"] == 201
-    assert result["body_encoding"] == "text"
+    assert result["body_format"] == "json"
+    assert "headers" not in result
     assert "my-secret-value" not in json.dumps(result)
-    assert "[REDACTED]" in result["body"]
+    assert "[REDACTED]" in result["body"]["message"]
 
 
 def test_basic_auth_and_form(monkeypatch):
@@ -68,8 +69,9 @@ def test_basic_auth_and_form(monkeypatch):
         transport=httpx.MockTransport(handle),
     )
     assert result["status_code"] == 200
-    assert "[REDACTED]" in result["body"]
-    assert "cGFzc3dvcmQxMjM=" not in result["body"]
+    assert result["body_format"] == "json"
+    assert "[REDACTED]" in result["body"]["authorization"]
+    assert "cGFzc3dvcmQxMjM=" not in result["body"]["authorization"]
 
 
 def test_body_limits_and_no_truncated_response():
@@ -92,6 +94,7 @@ def test_body_limits_and_no_truncated_response():
                    max_response_bytes=MAX_LIMIT)
     assert accepted["size_bytes"] == DEFAULT_LIMIT + 1
     assert accepted["body"] == "x" * (DEFAULT_LIMIT + 1)
+    assert accepted["body_format"] == "text"
 
     overflow = run(method="GET", url="https://example.test", transport=transport,
                    max_response_bytes=MAX_LIMIT + 1)
@@ -132,7 +135,7 @@ def test_mcp_tools_registered():
     async def check():
         async with Client(mcp, mode="legacy") as client:
             assert client.server_info.name == "Freedo"
-            assert client.server_info.version == version("freedo") == "0.1.1"
+            assert client.server_info.version == version("freedo") == "0.2.0"
             names = {tool.name for tool in await client.list_tools()}
             assert names == {"list_env", "http_request"}
             response = await client.call_tool("list_env", {})
@@ -177,9 +180,11 @@ def test_github_rest_and_graphql_with_generic_credentials(monkeypatch):
         transport=transport
     )
     assert rest["status_code"] == 200
-    assert json.loads(rest["body"])["login"] == "sample-user"
+    assert rest["body"]["login"] == "sample-user"
+    assert rest["body_format"] == "json"
     assert graphql["status_code"] == 200
-    assert json.loads(graphql["body"])["data"]["viewer"]["login"] == "sample-user"
+    assert graphql["body"]["data"]["viewer"]["login"] == "sample-user"
+    assert graphql["body_format"] == "json"
 
 
 def test_base64_raw_body():
@@ -193,3 +198,76 @@ def test_base64_raw_body():
     )
     assert result["status_code"] == 200
     assert result["body"] == "ok"
+    assert result["body_format"] == "text"
+
+def test_json_response_types_and_malformed_json():
+    responses = {
+        "/object": httpx.Response(200, json={"ready": True}),
+        "/array": httpx.Response(400, content=b'[1,{"ok":false}]',
+                                 headers={"Content-Type": "application/problem+json"}),
+        "/null": httpx.Response(200, content=b"null",
+                                headers={"Content-Type": "application/json; charset=utf-8"}),
+        "/number": httpx.Response(200, content=b"42",
+                                  headers={"Content-Type": "application/json"}),
+        "/bool": httpx.Response(200, content=b"false",
+                                headers={"Content-Type": "application/json"}),
+        "/string": httpx.Response(200, content=b'"hello"',
+                                  headers={"Content-Type": "application/json"}),
+        "/invalid": httpx.Response(200, content=b'{"incomplete":',
+                                   headers={"Content-Type": "application/json"}),
+        "/text": httpx.Response(200, content=b'{"not":"json"}',
+                                headers={"Content-Type": "text/plain"}),
+        "/binary": httpx.Response(200, content=b"\\x00\\xff",
+                                  headers={"Content-Type": "application/octet-stream"}),
+    }
+    transport = httpx.MockTransport(lambda request: responses[request.url.path])
+    expected = {
+        "/object": ("json", {"ready": True}),
+        "/array": ("json", [1, {"ok": False}]),
+        "/null": ("json", None),
+        "/number": ("json", 42),
+        "/bool": ("json", False),
+        "/string": ("json", "hello"),
+        "/invalid": ("text", '{"incomplete":'),
+        "/text": ("text", '{"not":"json"}'),
+        "/binary": ("base64", "AP8="),
+    }
+    for path, (fmt, value) in expected.items():
+        result = run(method="GET", url="https://example.test" + path, transport=transport)
+        assert result["body_format"] == fmt, path
+        assert result["body"] == value, path
+        assert "headers" not in result, path
+    assert run(method="GET", url="https://example.test/array",
+               transport=transport)["status_code"] == 400
+
+
+def test_json_redaction_and_optional_headers(monkeypatch):
+    monkeypatch.setenv("APIKEY_SAMPLE", '{"key":"my-secret-value"}')
+
+    def handle(request):
+        assert request.headers["authorization"] == "Bearer my-secret-value"
+        return httpx.Response(
+            201,
+            json={"nested": [{"my-secret-value-key": "prefix my-secret-value"}],
+                  "plain": ["safe", {"token": "my-secret-value"}]},
+            headers={"X-Secret-Echo": "my-secret-value", "Location": "/created"},
+        )
+
+    transport = httpx.MockTransport(handle)
+    kwargs = {
+        "method": "POST", "url": "https://example.test/resource",
+        "headers": {"Authorization": "Bearer {{env:APIKEY_SAMPLE}}"},
+        "transport": transport,
+    }
+    normal = run(**kwargs)
+    assert "headers" not in normal
+    assert normal["body_format"] == "json"
+    assert normal["body"]["nested"] == [{"[REDACTED]-key": "prefix [REDACTED]"}]
+    assert normal["body"]["plain"] == ["safe", {"token": "[REDACTED]"}]
+    assert "my-secret-value" not in json.dumps(normal)
+
+    detailed = run(**kwargs, include_response_headers=True)
+    assert detailed["headers"]["x-secret-echo"] == "[REDACTED]"
+    assert detailed["headers"]["location"] == "/created"
+    assert detailed["body"] == normal["body"]
+    assert "my-secret-value" not in json.dumps(detailed)

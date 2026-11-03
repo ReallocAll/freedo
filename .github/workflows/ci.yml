@@ -48,7 +48,10 @@ jobs:
                   assert not result.is_error
                   payload = json.loads(result.content[0].text)
                   assert payload["status_code"] == 200, payload
-                  assert json.loads(payload["body"])["private"] is True
+                  assert payload["body_format"] == "json"
+                  assert payload["body"]["private"] is True
+                  assert "headers" not in payload
+                  assert result.structured_content is None
                   print("Live authenticated GitHub API MCP roundtrip succeeded")
 
           asyncio.run(main())

@@ -64,11 +64,28 @@ Use a credential reference anywhere in a string value (including nested JSON val
 }
 ```
 
-Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`. For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
+Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
 Each request and response body defaults to 2 MiB (2,097,152 bytes); both limits can be increased independently up to 4 MiB (4,194,304 bytes). Request size is calculated *after* credential substitution and encoding. If a response exceeds the selected limit, Freedo stops reading it and returns an error rather than a partial body. Binary response bodies are base64 encoded. Unusually escape-heavy output may hit the Horizon MCP envelope limit even if the raw HTTP body fits; the tool returns an explicit error.
 
-Large `http_request` outputs use a single MCP `content` text item, without duplicating the JSON under `structuredContent`. `list_env` retains its small structured result for discovery.\n\nHTTP 4xx/5xx status codes are returned as normal HTTP results, not MCP failures. Redirects are not followed. Network errors are returned without exception text because exception text could contain credential-bearing URLs. Exact credential values used in a request are redacted from textual output when echoed by a server.
+### Response format (v0.2.0)
+
+`http_request` emits one MCP text item containing a JSON object, without duplicate `structuredContent`. Response headers are **omitted by default**:
+
+```json
+{"status_code":200,"body":{"login":"example"},"body_format":"json","size_bytes":19}
+```
+
+- `body_format="json"`: valid `application/json` or `+json` media types are parsed into native JSON (object, array, string, number, boolean, or null).
+- `body_format="text"`: decodable non-JSON content, and malformed JSON, is returned as text.
+- `body_format="base64"`: undecodable binary content is Base64 encoded.
+- Pass `include_response_headers=true` to include `headers` for `Link` pagination, `Location` redirects, `Retry-After` limits, or diagnostics.
+
+**Breaking change (0.1.x → 0.2.0):** JSON `body` is now parsed, so read `result["body"]["field"]` instead of calling `json.loads(result["body"])`. `body_encoding` becomes `body_format`; `headers` are no longer present by default. No legacy response mode is included.
+
+Large `http_request` outputs use a single MCP `content` text item, without duplicating the JSON under `structuredContent`. `list_env` retains its small structured result for discovery.
+
+HTTP 4xx/5xx status codes are returned as normal HTTP results, not MCP failures. Redirects are not followed. Network errors are returned without exception text because exception text could contain credential-bearing URLs. Exact credentials used in a request are redacted from text and nested JSON string keys/values when echoed by a server.
 
 **Trust boundary:** This is a private, powerful HTTP executor. An authorized agent can choose arbitrary network destinations and attach configured credentials. Enable Horizon's managed authentication and connect only trusted agents. Freedo does not constrain provider hosts, inspect API permissions, or add confirmation workflows.
 

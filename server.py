@@ -76,9 +76,16 @@ def _limit(value: int, name: str) -> int:
     return value
 
 
-def _redact(value: str, used: set[str]) -> str:
-    for secret in sorted(used, key=len, reverse=True):
-        value = value.replace(secret, "[REDACTED]")
+def _redact(value: Any, used: set[str]) -> Any:
+    """Redact credential echoes in strings and nested JSON keys and values."""
+    if isinstance(value, str):
+        for secret in sorted(used, key=len, reverse=True):
+            value = value.replace(secret, "[REDACTED]")
+        return value
+    if isinstance(value, list):
+        return [_redact(item, used) for item in value]
+    if isinstance(value, dict):
+        return {_redact(key, used): _redact(item, used) for key, item in value.items()}
     return value
 
 
@@ -107,6 +114,7 @@ async def _execute_request(
     timeout: float = 60,
     max_request_bytes: int = DEFAULT_LIMIT,
     max_response_bytes: int = DEFAULT_LIMIT,
+    include_response_headers: bool = False,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
@@ -170,20 +178,35 @@ async def _execute_request(
                     chunks.append(chunk)
 
                 body = b"".join(chunks)
-                encoding = response.encoding or "utf-8"
                 try:
-                    decoded = body.decode(encoding)
-                    body_encoding = "text"
+                    decoded = body.decode(response.encoding or "utf-8")
                 except (UnicodeDecodeError, LookupError):
-                    decoded = base64.b64encode(body).decode("ascii")
-                    body_encoding = "base64"
-                return {
+                    result_body: Any = base64.b64encode(body).decode("ascii")
+                    body_format = "base64"
+                else:
+                    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if media_type == "application/json" or media_type.endswith("+json"):
+                        try:
+                            result_body = json.loads(decoded)
+                        except json.JSONDecodeError:
+                            result_body = decoded
+                            body_format = "text"
+                        else:
+                            body_format = "json"
+                    else:
+                        result_body = decoded
+                        body_format = "text"
+                    result_body = _redact(result_body, used)
+
+                result = {
                     "status_code": response.status_code,
-                    "headers": {k: _redact(v, used) for k, v in response.headers.items()},
-                    "body": _redact(decoded, used) if body_encoding == "text" else decoded,
-                    "body_encoding": body_encoding,
+                    "body": result_body,
+                    "body_format": body_format,
                     "size_bytes": len(body),
                 }
+                if include_response_headers:
+                    result["headers"] = _redact(dict(response.headers), used)
+                return result
             finally:
                 await response.aclose()
     except FreedoError as exc:
@@ -210,6 +233,7 @@ async def http_request(
     timeout: float = 60,
     max_request_bytes: int = DEFAULT_LIMIT,
     max_response_bytes: int = DEFAULT_LIMIT,
+    include_response_headers: bool = False,
 ) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
 
@@ -217,14 +241,17 @@ async def http_request(
     URLs, HTTP methods and auth headers using the provider's official API docs.
     basic_auth accepts username/password strings with the same reference syntax.
     Bodies are mutually exclusive: json_body, text_body, form_body or body_base64.
-    Response is JSON text with status_code, headers, body, body_encoding and
-    size_bytes; non-UTF text/binary bodies are base64 encoded. HTTP 4xx/5xx
-    responses are returned normally. Redirects are never followed automatically.
-    Request and response body defaults are 2 MiB each, configurable up to 4 MiB.
+    Response is a single JSON text item with status_code, body, body_format
+    (json/text/base64), and size_bytes. JSON media types return native JSON
+    values; malformed JSON falls back to text. Use include_response_headers
+    to return headers for pagination, redirects, caching, or diagnostics.
+    HTTP 4xx/5xx are returned normally; redirects are never followed.
+    Body limits default to 2 MiB and can be raised to 4 MiB.
     """
     result = await _execute_request(
         method, url, headers, params, json_body, text_body, form_body,
-        body_base64, basic_auth, timeout, max_request_bytes, max_response_bytes
+        body_base64, basic_auth, timeout, max_request_bytes, max_response_bytes,
+        include_response_headers
     )
     return ToolResult(content=_format_result(result))
 
