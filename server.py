@@ -1,7 +1,11 @@
 """Freedo: a provider-agnostic HTTP API MCP for trusted agents."""
 
 import base64
+import codecs
 import json
+import tempfile
+from contextlib import nullcontext
+from datetime import timedelta
 from importlib.metadata import version
 import os
 import re
@@ -10,13 +14,21 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
+from fastmcp_tasks import TasksExtension
+
+from result_cache import MAX_STORED_BYTES, ResultCache, ResultNotFoundError, ResourceLimitError
 
 mcp = FastMCP("Freedo", version=version("freedo"))
+mcp.add_extension(TasksExtension())
 
 DEFAULT_LIMIT = 2 * 1024 * 1024
 MAX_LIMIT = 4 * 1024 * 1024
 # Leave room for JSON/MCP framing within Horizon's measured 6 MB response limit.
 MAX_TOOL_ENVELOPE = 5_500_000
+MAX_PAGE_RESPONSE_BYTES = 4 * 1024 * 1024
+DEFAULT_PAGE_BYTES = 2 * 1024 * 1024
+AUTO_FOREGROUND_SECONDS = 15
+RESULTS = ResultCache()
 REFERENCE = re.compile(r"\{\{env:(APIKEY_[A-Za-z0-9_]+)\}\}")
 
 
@@ -70,9 +82,9 @@ def _inject(value: Any, used: set[str]) -> Any:
     return value
 
 
-def _limit(value: int, name: str) -> int:
-    if not isinstance(value, int) or not 0 < value <= MAX_LIMIT:
-        raise FreedoError(f"{name} must be between 1 and {MAX_LIMIT} bytes")
+def _limit(value: int, name: str, maximum: int = MAX_LIMIT) -> int:
+    if type(value) is not int or not 0 < value <= maximum:
+        raise FreedoError(f"{name} must be between 1 and {maximum} bytes")
     return value
 
 
@@ -101,6 +113,189 @@ def _format_result(payload: dict[str, Any]) -> str:
     return result
 
 
+
+def _framed_size(payload: dict[str, Any]) -> int:
+    """Count the serialized JSON-RPC result, including the MCP text wrapper."""
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    envelope = {
+        "jsonrpc": "2.0", "id": "0" * 64,
+        "result": {"content": [{"type": "text", "text": text}], "isError": False},
+    }
+    return len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _safe_body(body: bytes, encoding: str, media_type: str, used: set[str],
+               parse_json: bool) -> tuple[str, bytes, Any | None]:
+    """Redact before caching; small JSON may also be returned as a native value."""
+    try:
+        decoded = body.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        result = body
+        for secret in sorted(used, key=len, reverse=True):
+            result = result.replace(secret.encode("utf-8"), b"[REDACTED]")
+        return "base64", result, None
+
+    json_type = media_type == "application/json" or media_type.endswith("+json")
+    if json_type and parse_json:
+        try:
+            value = _redact(json.loads(decoded), used)
+        except json.JSONDecodeError:
+            pass
+        else:
+            safe = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return "json", safe, value
+
+    decoded = _redact(decoded, used)
+    if json_type:
+        # JSON string escaping may hide a secret from a literal replacement.
+        for secret in sorted(used, key=len, reverse=True):
+            decoded = decoded.replace(json.dumps(secret, ensure_ascii=True)[1:-1], "[REDACTED]")
+    return ("json" if json_type and not parse_json else "text"), decoded.encode("utf-8"), None
+
+
+def _paged_result(status_code: int, size_bytes: int, body_format: str,
+                  data: bytes, headers: dict[str, str] | None) -> dict[str, Any]:
+    reference = RESULTS.put(data, body_format, status_code, size_bytes, headers)
+    result: dict[str, Any] = {
+        "status_code": status_code, "size_bytes": size_bytes,
+        "body_format": body_format, "paged": True,
+        "result_ref": reference, "stored_bytes": len(data),
+    }
+    if headers is not None:
+        result["headers"] = headers
+    return result
+
+
+def _page_payload(reference: str, data: bytes, body_format: str, offset: int,
+                  limit: int, status_code: int, source_size_bytes: int,
+                  headers: dict[str, str] | None) -> dict[str, Any]:
+    remaining = len(data) - offset
+    requested = min(limit, remaining)
+
+    def candidate(count: int) -> tuple[dict[str, Any], int]:
+        chunk = data[offset:offset + count]
+        if body_format != "base64":
+            # Never return partial UTF-8 sequences. next_offset remains exact.
+            while chunk:
+                try:
+                    value = chunk.decode("utf-8")
+                    break
+                except UnicodeDecodeError as exc:
+                    if exc.reason != "unexpected end of data":
+                        raise FreedoError("offset must be a UTF-8 boundary")
+                    chunk = chunk[:exc.start]
+            else:
+                value = ""
+        else:
+            value = base64.b64encode(chunk).decode("ascii")
+        actual = len(chunk)
+        payload = {
+            "result_ref": reference, "offset": offset,
+            "requested_bytes": limit, "returned_bytes": actual,
+            "total_bytes": len(data), "data": value,
+            "data_encoding": "base64" if body_format == "base64" else "utf-8",
+            "size_limit_adjusted": actual < requested,
+            "has_more": offset + actual < len(data),
+            "next_offset": offset + actual if offset + actual < len(data) else None,
+            "mcp_response_bytes": 0,
+            "body_format": body_format,
+            "status_code": status_code,
+            "source_size_bytes": source_size_bytes,
+        }
+        if headers is not None:
+            payload["headers"] = headers
+        if payload["size_limit_adjusted"]:
+            payload["size_limit_reason"] = ("mcp_response_budget" if count < requested
+                                            else "utf8_boundary")
+        for _ in range(3):
+            size = _framed_size(payload)
+            if payload["mcp_response_bytes"] == size:
+                break
+            payload["mcp_response_bytes"] = size
+        return payload, _framed_size(payload)
+
+    result, total = candidate(requested)
+    # Keep a small allowance for transport-specific framing outside Freedo.
+    budget = MAX_PAGE_RESPONSE_BYTES - 8192
+    if total < budget:
+        return result
+    low, high = 1, requested
+    best: dict[str, Any] | None = None
+    while low <= high:
+        mid = (low + high) // 2
+        trial, total = candidate(mid)
+        if total < budget and trial["returned_bytes"]:
+            best = trial
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best is None:
+        raise FreedoError("page cannot fit the MCP response budget")
+    return best
+
+
+def _redact_stream(source, dest, used: set[str]) -> None:
+    """Bounded-memory credential replacement across read boundaries."""
+    values = set()
+    for secret in used:
+        values.add(secret.encode("utf-8"))
+        values.add(json.dumps(secret, ensure_ascii=True)[1:-1].encode("ascii"))
+    values.discard(b"")
+    if not values:
+        while chunk := source.read(1024 * 1024):
+            dest.write(chunk)
+        return
+    patterns = sorted(values, key=len, reverse=True)
+    matcher = re.compile(b"|".join(re.escape(pattern) for pattern in patterns))
+    overlap = max(map(len, patterns)) - 1
+    pending = b""
+    while chunk := source.read(1024 * 1024):
+        pending += chunk
+        safe = max(0, len(pending) - overlap)
+        consumed = 0
+        for match in matcher.finditer(pending):
+            if match.start() >= safe:
+                break
+            dest.write(pending[consumed:match.start()])
+            dest.write(b"[REDACTED]")
+            consumed = match.end()
+        if consumed < safe:
+            dest.write(pending[consumed:safe])
+            pending = pending[safe:]
+        else:
+            pending = pending[consumed:]
+    dest.write(matcher.sub(b"[REDACTED]", pending))
+
+
+def _materialize_paged(source, encoding: str, media_type: str,
+                       used: set[str]) -> tuple[str, bytes]:
+    """Redact and validate large responses without full-size intermediate copies."""
+    # Avoid a second full-size disk copy when no credential needs redaction.
+    with (tempfile.TemporaryFile() if used else nullcontext(source)) as clean:
+        source.seek(0)
+        if used:
+            _redact_stream(source, clean, used)
+        clean.seek(0, 2)
+        size = clean.tell()
+        if size > MAX_STORED_BYTES:
+            raise ResourceLimitError("redacted response exceeds maximum storage size")
+        clean.seek(0)
+        body_format = "base64"
+        if encoding.lower().replace("_", "-") in ("utf-8", "utf8", "utf-8-sig"):
+            try:
+                decoder = codecs.getincrementaldecoder(encoding)("strict")
+                while chunk := clean.read(1024 * 1024):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+                body_format = ("json" if media_type == "application/json"
+                               or media_type.endswith("+json") else "text")
+            except (UnicodeError, LookupError):
+                pass
+        RESULTS.reserve(size + 16 * 1024 * 1024)
+        clean.seek(0)
+        return body_format, clean.read()
+
+
 async def _execute_request(
     method: str,
     url: str,
@@ -115,6 +310,7 @@ async def _execute_request(
     max_request_bytes: int = DEFAULT_LIMIT,
     max_response_bytes: int = DEFAULT_LIMIT,
     include_response_headers: bool = False,
+    max_total_response_bytes: int = MAX_STORED_BYTES,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
@@ -122,6 +318,7 @@ async def _execute_request(
     try:
         request_limit = _limit(max_request_bytes, "max_request_bytes")
         response_limit = _limit(max_response_bytes, "max_response_bytes")
+        total_limit = _limit(max_total_response_bytes, "max_total_response_bytes", MAX_STORED_BYTES)
         if timeout <= 0:
             raise FreedoError("timeout must be positive")
         if sum(value is not None for value in (json_body, text_body, form_body, body_base64)) > 1:
@@ -165,58 +362,67 @@ async def _execute_request(
 
             response = await client.send(request, stream=True)
             try:
-                chunks: list[bytes] = []
-                size = 0
-                async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > response_limit:
-                        return {
-                            "error": "response_too_large",
-                            "limit_bytes": response_limit,
-                            "status_code": response.status_code,
-                        }
-                    chunks.append(chunk)
+                with tempfile.TemporaryFile() as output:
+                    size = 0
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > total_limit:
+                            return {
+                                "error": "response_too_large", "limit_bytes": total_limit,
+                                "status_code": response.status_code,
+                            }
+                        output.write(chunk)
 
-                body = b"".join(chunks)
-                try:
-                    decoded = body.decode(response.encoding or "utf-8")
-                except (UnicodeDecodeError, LookupError):
-                    result_body: Any = base64.b64encode(body).decode("ascii")
-                    body_format = "base64"
-                else:
                     media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                    if media_type == "application/json" or media_type.endswith("+json"):
-                        try:
-                            result_body = json.loads(decoded)
-                        except json.JSONDecodeError:
-                            result_body = decoded
-                            body_format = "text"
-                        else:
-                            body_format = "json"
+                    if size > response_limit:
+                        body_format, safe_bytes = _materialize_paged(
+                            output, response.encoding or "utf-8", media_type, used
+                        )
+                        value = None
                     else:
-                        result_body = decoded
-                        body_format = "text"
-                    result_body = _redact(result_body, used)
+                        output.seek(0)
+                        body_format, safe_bytes, value = _safe_body(
+                            output.read(), response.encoding or "utf-8", media_type,
+                            used, parse_json=True
+                        )
+                safe_headers = (_redact(dict(response.headers), used)
+                                if include_response_headers else None)
 
-                result = {
-                    "status_code": response.status_code,
-                    "body": result_body,
-                    "body_format": body_format,
-                    "size_bytes": len(body),
-                }
-                if include_response_headers:
-                    result["headers"] = _redact(dict(response.headers), used)
-                return result
+                if size <= response_limit:
+                    if body_format == "base64":
+                        value = base64.b64encode(safe_bytes).decode("ascii")
+                    elif value is None and body_format != "json":
+                        value = safe_bytes.decode("utf-8")
+                    elif value is None and body_format == "json":
+                        # JSON null is a valid native value; distinguish it from
+                        # text fallback by parsing the already sanitized document.
+                        try:
+                            value = json.loads(safe_bytes)
+                        except json.JSONDecodeError:
+                            body_format = "text"
+                            value = safe_bytes.decode("utf-8")
+                    inline: dict[str, Any] = {
+                        "status_code": response.status_code, "body": value,
+                        "body_format": body_format, "size_bytes": size,
+                    }
+                    if safe_headers is not None:
+                        inline["headers"] = safe_headers
+                    if _framed_size(inline) < MAX_TOOL_ENVELOPE:
+                        return inline
+                return _paged_result(response.status_code, size, body_format,
+                                     safe_bytes, safe_headers)
             finally:
                 await response.aclose()
     except FreedoError as exc:
         return {"error": "invalid_request", "detail": str(exc)}
+    except (MemoryError, ResourceLimitError):
+        return {"error": "resource_limit", "detail": "insufficient memory"}
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         # Exceptions can contain the expanded URL, including an API key in its path.
         return {"error": "http_error", "type": type(exc).__name__}
 
 
-@mcp.tool(annotations={
+@mcp.tool(task=True, annotations={
     "readOnlyHint": False, "destructiveHint": True,
     "idempotentHint": False, "openWorldHint": True,
 })
@@ -230,10 +436,12 @@ async def http_request(
     form_body: dict[str, str] | None = None,
     body_base64: str | None = None,
     basic_auth: dict[str, str] | None = None,
-    timeout: float = 60,
+    timeout: float | None = None,
     max_request_bytes: int = DEFAULT_LIMIT,
     max_response_bytes: int = DEFAULT_LIMIT,
     include_response_headers: bool = False,
+    max_total_response_bytes: int = MAX_STORED_BYTES,
+    execution: str = "auto",
 ) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
 
@@ -246,12 +454,107 @@ async def http_request(
     values; malformed JSON falls back to text. Use include_response_headers
     to return headers for pagination, redirects, caching, or diagnostics.
     HTTP 4xx/5xx are returned normally; redirects are never followed.
-    Body limits default to 2 MiB and can be raised to 4 MiB.
+    Request bodies have a 2-4 MiB limit. The response inline limit is 2-4 MiB;
+    larger bodies up to max_total_response_bytes (512 MiB default) are cached
+    for read_result pagination. execution is auto (15s front window), direct,
+    or background. Direct defaults to 60s HTTP timeout; auto/background to 600s.
+    Poll background task IDs with get_request. Docket and result cache are process-local.
     """
-    result = await _execute_request(
+    if execution not in ("auto", "direct", "background"):
+        return ToolResult(content=_format_result({
+            "error": "invalid_request",
+            "detail": "execution must be auto, direct or background"
+        }))
+    effective_timeout = (60 if execution == "direct" else 600) if timeout is None else timeout
+    arguments = (
         method, url, headers, params, json_body, text_body, form_body,
-        body_base64, basic_auth, timeout, max_request_bytes, max_response_bytes,
-        include_response_headers
+        body_base64, basic_auth, effective_timeout, max_request_bytes,
+        max_response_bytes, include_response_headers, max_total_response_bytes,
     )
-    return ToolResult(content=_format_result(result))
+    if execution == "direct":
+        return ToolResult(content=_format_result(await _execute_request(*arguments)))
 
+    docket = mcp.docket
+    if docket is None:
+        return ToolResult(content=_format_result({"error": "background_unavailable"}))
+    try:
+        execution_ref = await docket.add(_run_background_http)(arguments)
+    except Exception:
+        return ToolResult(content=_format_result({"error": "background_schedule_failed"}))
+
+    task_id = execution_ref.key
+    if execution == "auto":
+        try:
+            # Waiting does not cancel or resubmit the scheduled Docket execution.
+            result = await execution_ref.get_result(
+                timeout=timedelta(seconds=AUTO_FOREGROUND_SECONDS)
+            )
+            return ToolResult(content=_format_result(result))
+        except TimeoutError:
+            pass
+        except Exception:
+            return ToolResult(content=_format_result({
+                "error": "background_execution_failed", "task_id": task_id,
+            }))
+    return ToolResult(content=_format_result({
+        "task_id": task_id, "status": "working", "poll_tool": "get_request",
+        "poll_interval_seconds": 5,
+    }))
+
+
+async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
+    """Docket worker entrypoint; credentials are resolved only during execution."""
+    return await _execute_request(*arguments)
+
+
+@mcp.tool()
+async def get_request(task_id: str) -> ToolResult:
+    """Poll a Docket HTTP execution; results remain readable while retained."""
+    docket = mcp.docket
+    if docket is None:
+        return ToolResult(content=_format_result({"error": "background_unavailable"}))
+    try:
+        execution_ref = await docket.get_execution(task_id)
+    except Exception:
+        return ToolResult(content=_format_result({"error": "background_lookup_failed"}))
+    if execution_ref is None:
+        return ToolResult(content=_format_result({"error": "TASK_NOT_FOUND"}))
+    status = execution_ref.state.value
+    if status in ("scheduled", "queued", "running"):
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "working",
+        }))
+    if status != "completed":
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "failed",
+        }))
+    try:
+        result = await execution_ref.get_result()
+    except Exception:
+        return ToolResult(content=_format_result({
+            "task_id": task_id, "status": "failed",
+        }))
+    return ToolResult(content=_format_result({
+        "task_id": task_id, "status": "completed", "result": result,
+    }))
+
+@mcp.tool()
+def read_result(result_ref: str, offset: int = 0,
+                limit_bytes: int = DEFAULT_PAGE_BYTES) -> ToolResult:
+    """Read cached HTTP response by byte offset. Final MCP result stays below 4 MiB."""
+    try:
+        _limit(limit_bytes, "limit_bytes")
+        if type(offset) is not int or offset < 0:
+            raise FreedoError("offset must be a nonnegative integer")
+        with RESULTS.borrow(result_ref) as item:
+            if offset > len(item.data):
+                raise FreedoError("offset exceeds cached result size")
+            page = _page_payload(
+                result_ref, item.data, item.body_format, offset, limit_bytes,
+                item.status_code, item.size_bytes, item.headers
+            )
+            return ToolResult(content=_format_result(page))
+    except ResultNotFoundError:
+        return ToolResult(content=_format_result({"error": "RESULT_NOT_FOUND"}))
+    except FreedoError as exc:
+        return ToolResult(content=_format_result({"error": "invalid_request", "detail": str(exc)}))
