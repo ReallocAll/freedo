@@ -1,0 +1,220 @@
+"""Freedo: a provider-agnostic HTTP API MCP for trusted agents."""
+
+import base64
+import json
+import os
+import re
+from typing import Any
+
+import httpx
+from fastmcp import FastMCP
+
+mcp = FastMCP("Freedo")
+
+DEFAULT_LIMIT = 2 * 1024 * 1024
+MAX_LIMIT = 4 * 1024 * 1024
+# Leave room for JSON/MCP framing within Horizon's measured 6 MB response limit.
+MAX_TOOL_ENVELOPE = 5_500_000
+REFERENCE = re.compile(r"\{\{env:(APIKEY_[A-Za-z0-9_]+)\}\}")
+
+
+class FreedoError(ValueError):
+    """A user-actionable error that contains no credential values."""
+
+
+def _credential(name: str) -> dict[str, str]:
+    raw = os.environ.get(name)
+    if not name.startswith("APIKEY_") or raw is None:
+        raise FreedoError(f"Unknown credential: {name}")
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise FreedoError(f"Invalid JSON for {name}") from exc
+    if not isinstance(config, dict) or not isinstance(config.get("key"), str) or not config["key"]:
+        raise FreedoError(f"{name} must contain a nonempty string 'key'")
+    if "desc" in config and not isinstance(config["desc"], str):
+        raise FreedoError(f"{name} 'desc' must be a string")
+    return config
+
+
+@mcp.tool
+def list_env() -> dict[str, list[dict[str, str]]]:
+    """List available APIKEY_* credentials and optional descriptions; never return keys."""
+    entries = []
+    for name in sorted(n for n in os.environ if n.startswith("APIKEY_")):
+        try:
+            config = _credential(name)
+            entry = {"name": name}
+            if "desc" in config:
+                entry["desc"] = config["desc"]
+        except FreedoError as exc:
+            entry = {"name": name, "error": str(exc)}
+        entries.append(entry)
+    return {"credentials": entries}
+
+
+def _inject(value: Any, used: set[str]) -> Any:
+    """Replace credential references in strings, including nested JSON values."""
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            key = _credential(match.group(1))["key"]
+            used.add(key)
+            return key
+        return REFERENCE.sub(replace, value)
+    if isinstance(value, list):
+        return [_inject(item, used) for item in value]
+    if isinstance(value, dict):
+        return {key: _inject(item, used) for key, item in value.items()}
+    return value
+
+
+def _limit(value: int, name: str) -> int:
+    if not isinstance(value, int) or not 0 < value <= MAX_LIMIT:
+        raise FreedoError(f"{name} must be between 1 and {MAX_LIMIT} bytes")
+    return value
+
+
+def _redact(value: str, used: set[str]) -> str:
+    for secret in sorted(used, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
+    return value
+
+
+def _format_result(payload: dict[str, Any]) -> str:
+    """Return one MCP text item; check framing expansion against Horizon's limit."""
+    result = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    framed_bytes = len(json.dumps({"text": result}, ensure_ascii=False).encode("utf-8"))
+    if framed_bytes > MAX_TOOL_ENVELOPE:
+        return json.dumps({
+            "error": "mcp_result_too_large",
+            "detail": "Response fits the HTTP limit but not the MCP transport envelope. Retry with a smaller max_response_bytes.",
+        })
+    return result
+
+
+async def _execute_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | list[Any] | None = None,
+    text_body: str | None = None,
+    form_body: dict[str, str] | None = None,
+    basic_auth: dict[str, str] | None = None,
+    timeout: float = 60,
+    max_request_bytes: int = DEFAULT_LIMIT,
+    max_response_bytes: int = DEFAULT_LIMIT,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """The HTTP execution core; transport is injected only by local tests."""
+    try:
+        request_limit = _limit(max_request_bytes, "max_request_bytes")
+        response_limit = _limit(max_response_bytes, "max_response_bytes")
+        if timeout <= 0:
+            raise FreedoError("timeout must be positive")
+        if sum(value is not None for value in (json_body, text_body, form_body)) > 1:
+            raise FreedoError("Choose only one of json_body, text_body or form_body")
+
+        used: set[str] = set()
+        url = _inject(url, used)
+        headers = _inject(headers or {}, used)
+        params = _inject(params, used) if params is not None else None
+        json_body = _inject(json_body, used)
+        text_body = _inject(text_body, used)
+        form_body = _inject(form_body, used)
+        if basic_auth is not None:
+            auth = _inject(basic_auth, used)
+            if set(auth) != {"username", "password"} or "authorization" in {k.lower() for k in headers}:
+                raise FreedoError("basic_auth requires username/password and no Authorization header")
+            raw = f"{auth['username']}:{auth['password']}".encode("utf-8")
+            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+
+        body_kwargs: dict[str, Any] = {}
+        if json_body is not None:
+            body_kwargs["json"] = json_body
+        elif text_body is not None:
+            body_kwargs["content"] = text_body.encode("utf-8")
+        elif form_body is not None:
+            body_kwargs["data"] = form_body
+
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, transport=transport
+        ) as client:
+            request = client.build_request(method, url, headers=headers, params=params, **body_kwargs)
+            size = len(request.content)
+            if size > request_limit:
+                return {"error": "request_too_large", "limit_bytes": request_limit, "size_bytes": size}
+
+            response = await client.send(request, stream=True)
+            try:
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > response_limit:
+                        return {
+                            "error": "response_too_large",
+                            "limit_bytes": response_limit,
+                            "status_code": response.status_code,
+                        }
+                    chunks.append(chunk)
+
+                body = b"".join(chunks)
+                encoding = response.encoding or "utf-8"
+                try:
+                    decoded = body.decode(encoding)
+                    body_encoding = "text"
+                except (UnicodeDecodeError, LookupError):
+                    decoded = base64.b64encode(body).decode("ascii")
+                    body_encoding = "base64"
+                return {
+                    "status_code": response.status_code,
+                    "headers": {k: _redact(v, used) for k, v in response.headers.items()},
+                    "body": _redact(decoded, used) if body_encoding == "text" else decoded,
+                    "body_encoding": body_encoding,
+                    "size_bytes": len(body),
+                }
+            finally:
+                await response.aclose()
+    except FreedoError as exc:
+        return {"error": "invalid_request", "detail": str(exc)}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        # Exceptions can contain the expanded URL, including an API key in its path.
+        return {"error": "http_error", "type": type(exc).__name__}
+
+
+@mcp.tool
+async def http_request(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | list[Any] | None = None,
+    text_body: str | None = None,
+    form_body: dict[str, str] | None = None,
+    basic_auth: dict[str, str] | None = None,
+    timeout: float = 60,
+    max_request_bytes: int = DEFAULT_LIMIT,
+    max_response_bytes: int = DEFAULT_LIMIT,
+) -> str:
+    """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
+
+    Consult list_env to discover configured credentials. Construct service-specific
+    URLs, HTTP methods and auth headers using the provider's official API docs.
+    basic_auth accepts username/password strings with the same reference syntax.
+    Bodies are mutually exclusive: json_body, text_body or form_body.
+    Response is JSON text with status_code, headers, body, body_encoding and
+    size_bytes; non-UTF text/binary bodies are base64 encoded. HTTP 4xx/5xx
+    responses are returned normally. Redirects are never followed automatically.
+    Request and response body defaults are 2 MiB each, configurable up to 4 MiB.
+    """
+    result = await _execute_request(
+        method, url, headers, params, json_body, text_body, form_body,
+        basic_auth, timeout, max_request_bytes, max_response_bytes
+    )
+    return _format_result(result)
+
+
+if __name__ == "__main__":
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
