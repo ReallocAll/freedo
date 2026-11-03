@@ -356,7 +356,7 @@ async def _execute_request(
         return {"error": "http_error", "type": type(exc).__name__}
 
 
-@mcp.tool(annotations={
+@mcp.tool(task=True, annotations={
     "readOnlyHint": False, "destructiveHint": True,
     "idempotentHint": False, "openWorldHint": True,
 })
