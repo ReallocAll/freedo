@@ -217,7 +217,7 @@ def test_json_response_types_and_malformed_json():
                                    headers={"Content-Type": "application/json"}),
         "/text": httpx.Response(200, content=b'{"not":"json"}',
                                 headers={"Content-Type": "text/plain"}),
-        "/binary": httpx.Response(200, content=b"\\x00\\xff",
+        "/binary": httpx.Response(200, content=b"\x00\xff",
                                   headers={"Content-Type": "application/octet-stream"}),
     }
     transport = httpx.MockTransport(lambda request: responses[request.url.path])
