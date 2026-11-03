@@ -83,14 +83,19 @@ def test_utf8_boundary_and_not_found(monkeypatch):
 
 def test_cache_evicts_only_on_rss_pressure_and_pins_reads():
     cache = None
+    incoming = []
     def rss():
-        return 10 * MIB + sum(len(x.data) for x in cache._entries.values())
+        return (10 * MIB + sum(len(x.data) for x in cache._entries.values())
+                + sum(map(len, incoming)))
     cache = ResultCache(rss_reader=rss, rss_limit=13 * MIB)
     a = cache.put(b"a" * MIB, "text", 200, MIB, None)
     b = cache.put(b"b" * MIB, "text", 200, MIB, None)
     assert set(cache._entries) == {a, b}
     with cache.borrow(a):
-        c = cache.put(b"c" * (2 * MIB), "text", 200, 2 * MIB, None)
+        new_data = b"c" * (2 * MIB)
+        incoming.append(new_data)
+        c = cache.put(new_data, "text", 200, 2 * MIB, None)
+        incoming.clear()
         assert a in cache._entries and b not in cache._entries
         assert c in cache._entries
     # The reserve checks actual memory admission, not arbitrary entry counts.

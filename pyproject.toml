@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest==9.2.0"]
+test = ["pytest==9.2.0", "pytest-asyncio>=1.4,<2"]
 
 [tool.setuptools]
 py-modules = ["server", "mcp_server", "result_cache"]
