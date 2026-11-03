@@ -263,6 +263,8 @@ async def test_missing_background_task_has_bounded_recovery_guidance():
     assert result["status"] == "unknown" and result["outcome_unknown"] is True
     assert result["serving_instance_id"] == server.INSTANCE_ID
     assert result["docket_backend"] == server.DOCKET_BACKEND
+    if server.DOCKET_BACKEND == "memory":
+        assert "not shared between Horizon instances" in result["message"]
     assert result["retry_after_seconds"] == 5
     assert result["max_additional_polls"] == 2
     assert result["do_not_resubmit_automatically"] is True

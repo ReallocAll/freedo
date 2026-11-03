@@ -464,7 +464,9 @@ async def http_request(
     larger bodies up to max_total_response_bytes (512 MiB default) are cached
     for read_result pagination. execution is auto (15s front window), direct,
     or background. Direct defaults to 60s HTTP timeout; auto/background to 600s.
-    Poll background task IDs with get_request. Docket and result cache are process-local.
+    Poll background task IDs with get_request. Docket defaults to process-local
+    memory; set FASTMCP_DOCKET_URL to shared Redis/Valkey for cross-instance tasks.
+    The paged response cache remains process-local.
     """
     if execution not in ("auto", "direct", "background"):
         return ToolResult(content=_format_result({
