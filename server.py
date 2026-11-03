@@ -2,6 +2,7 @@
 
 import base64
 import json
+from importlib.metadata import version
 import os
 import re
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
-mcp = FastMCP("Freedo")
+mcp = FastMCP("Freedo", version=version("freedo"))
 
 DEFAULT_LIMIT = 2 * 1024 * 1024
 MAX_LIMIT = 4 * 1024 * 1024
@@ -100,6 +101,7 @@ async def _execute_request(
     json_body: dict[str, Any] | list[Any] | None = None,
     text_body: str | None = None,
     form_body: dict[str, str] | None = None,
+    body_base64: str | None = None,
     basic_auth: dict[str, str] | None = None,
     timeout: float = 60,
     max_request_bytes: int = DEFAULT_LIMIT,
@@ -113,8 +115,8 @@ async def _execute_request(
         response_limit = _limit(max_response_bytes, "max_response_bytes")
         if timeout <= 0:
             raise FreedoError("timeout must be positive")
-        if sum(value is not None for value in (json_body, text_body, form_body)) > 1:
-            raise FreedoError("Choose only one of json_body, text_body or form_body")
+        if sum(value is not None for value in (json_body, text_body, form_body, body_base64)) > 1:
+            raise FreedoError("Choose only one of json_body, text_body, form_body or body_base64")
 
         used: set[str] = set()
         url = _inject(url, used)
@@ -138,6 +140,11 @@ async def _execute_request(
             body_kwargs["content"] = text_body.encode("utf-8")
         elif form_body is not None:
             body_kwargs["data"] = form_body
+        elif body_base64 is not None:
+            try:
+                body_kwargs["content"] = base64.b64decode(body_base64, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise FreedoError("body_base64 must be valid Base64") from exc
 
         async with httpx.AsyncClient(
             timeout=timeout, follow_redirects=False, transport=transport
@@ -185,7 +192,10 @@ async def _execute_request(
         return {"error": "http_error", "type": type(exc).__name__}
 
 
-@mcp.tool
+@mcp.tool(annotations={
+    "readOnlyHint": False, "destructiveHint": True,
+    "idempotentHint": False, "openWorldHint": True,
+})
 async def http_request(
     method: str,
     url: str,
@@ -194,6 +204,7 @@ async def http_request(
     json_body: dict[str, Any] | list[Any] | None = None,
     text_body: str | None = None,
     form_body: dict[str, str] | None = None,
+    body_base64: str | None = None,
     basic_auth: dict[str, str] | None = None,
     timeout: float = 60,
     max_request_bytes: int = DEFAULT_LIMIT,
@@ -204,7 +215,7 @@ async def http_request(
     Consult list_env to discover configured credentials. Construct service-specific
     URLs, HTTP methods and auth headers using the provider's official API docs.
     basic_auth accepts username/password strings with the same reference syntax.
-    Bodies are mutually exclusive: json_body, text_body or form_body.
+    Bodies are mutually exclusive: json_body, text_body, form_body or body_base64.
     Response is JSON text with status_code, headers, body, body_encoding and
     size_bytes; non-UTF text/binary bodies are base64 encoded. HTTP 4xx/5xx
     responses are returned normally. Redirects are never followed automatically.
@@ -212,10 +223,7 @@ async def http_request(
     """
     result = await _execute_request(
         method, url, headers, params, json_body, text_body, form_body,
-        basic_auth, timeout, max_request_bytes, max_response_bytes
+        body_base64, basic_auth, timeout, max_request_bytes, max_response_bytes
     )
     return _format_result(result)
 
-
-if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)

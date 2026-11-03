@@ -5,7 +5,10 @@ import json
 
 import httpx
 
-from server import DEFAULT_LIMIT, MAX_LIMIT, _execute_request, _format_result, list_env, mcp
+from importlib.metadata import version
+
+from mcp_server import mcp
+from server import DEFAULT_LIMIT, MAX_LIMIT, _execute_request, _format_result, list_env
 
 
 def run(**kwargs):
@@ -127,10 +130,58 @@ def test_mcp_tools_registered():
     from fastmcp import Client
 
     async def check():
-        async with Client(mcp) as client:
+        async with Client(mcp, mode="legacy") as client:
+            assert client.server_info.name == "Freedo"
+            assert client.server_info.version == version("freedo") == "0.1.0"
             names = {tool.name for tool in await client.list_tools()}
             assert names == {"list_env", "http_request"}
             response = await client.call_tool("list_env", {})
             assert not response.is_error
 
     asyncio.run(check())
+
+
+def test_github_rest_and_graphql_with_generic_credentials(monkeypatch):
+    monkeypatch.setenv(
+        "APIKEY_GITHUB",
+        '{"key":"github-test-token","desc":"GitHub REST and GraphQL APIs"}',
+    )
+    def handle(request):
+        assert request.headers["authorization"] == "Bearer github-test-token"
+        if request.url.path == "/user":
+            assert request.method == "GET"
+            return httpx.Response(200, json={"login":"sample-user"})
+        assert request.method == "POST"
+        assert request.url.path == "/graphql"
+        assert json.loads(request.content) == {"query": "query { viewer { login } }"}
+        return httpx.Response(200, json={"data": {"viewer": {"login": "sample-user"}}})
+
+    transport = httpx.MockTransport(handle)
+    rest = run(
+        method="GET", url="https://api.github.com/user",
+        headers={"Authorization": "Bearer {{env:APIKEY_GITHUB}}"},
+        transport=transport
+    )
+    graphql = run(
+        method="POST", url="https://api.github.com/graphql",
+        headers={"Authorization": "Bearer {{env:APIKEY_GITHUB}}"},
+        json_body={"query": "query { viewer { login } }"},
+        transport=transport
+    )
+    assert rest["status_code"] == 200
+    assert json.loads(rest["body"])["login"] == "sample-user"
+    assert graphql["status_code"] == 200
+    assert json.loads(graphql["body"])["data"]["viewer"]["login"] == "sample-user"
+
+
+def test_base64_raw_body():
+    def handle(request):
+        assert request.content == b"\x00\x01\xff"
+        return httpx.Response(200, content=b"ok")
+    result = run(
+        method="POST", url="https://example.test",
+        body_base64="AAH/",
+        transport=httpx.MockTransport(handle),
+    )
+    assert result["status_code"] == 200
+    assert result["body"] == "ok"

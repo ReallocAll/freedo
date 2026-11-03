@@ -19,6 +19,36 @@ Add one Horizon environment variable per credential, with a short name starting 
 
 `key` is required. `desc` is optional free text that may describe the URL, provider, scopes or documentation. No other fields are interpreted. Keep descriptions free of secrets.
 
+## GitHub API migration (recommended first integration)
+
+Configure Horizon variable **APIKEY_GITHUB** with a GitHub token and description:
+
+```json
+{"key":"ghp_your_token","desc":"GitHub REST https://api.github.com; docs https://docs.github.com/en/rest and https://docs.github.com/en/graphql; credential has the scopes I granted."}
+```
+
+The tool does not contain GitHub-specific code. Agents should obtain exact paths, request fields and permission requirements from the official API documentation.
+
+REST authenticated identity:
+
+```json
+{"method":"GET","url":"https://api.github.com/user","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}","Accept":"application/vnd.github+json"}}
+```
+
+GraphQL:
+
+```json
+{"method":"POST","url":"https://api.github.com/graphql","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}"},"json_body":{"query":"query { viewer { login } }"}}
+```
+
+Trigger a GitHub Actions workflow (write operation, subject to token permissions):
+
+```json
+{"method":"POST","url":"https://api.github.com/repos/OWNER/REPO/actions/workflows/WORKFLOW_ID/dispatches","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}"},"json_body":{"ref":"main"}}
+```
+
+Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and an explicit credential reference. Other API providers work exactly the same way. GitHub remains the first integration/test target, **not** an internal provider dependency.
+
 ## Tools
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
@@ -34,7 +64,7 @@ Use a credential reference anywhere in a string value (including nested JSON val
 }
 ```
 
-Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`. For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
+Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`. For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
 Each request and response body defaults to 2 MiB (2,097,152 bytes); both limits can be increased independently up to 4 MiB (4,194,304 bytes). Request size is calculated *after* credential substitution and encoding. If a response exceeds the selected limit, Freedo stops reading it and returns an error rather than a partial body. Binary response bodies are base64 encoded. Unusually escape-heavy output may hit the Horizon MCP envelope limit even if the raw HTTP body fits; the tool returns an explicit error.
 
@@ -45,17 +75,17 @@ HTTP 4xx/5xx status codes are returned as normal HTTP results, not MCP failures.
 ## Deploy to Horizon
 
 1. Connect this repository at https://horizon.prefect.io.
-2. Use entrypoint `server.py:mcp` and enable Horizon authentication.
+2. Use entrypoint `mcp_server.py:mcp` and enable Horizon authentication.
 3. Add `APIKEY_*` environment variables.
 4. Connect the deployed MCP to your agent.
 
-Horizon installs `requirements.txt` automatically. Local development:
+Horizon installs dependencies from `pyproject.toml` (the `requirements.txt` is a compatible `-e .` shim). Freedo reports its own version in MCP initialization metadata. Local development:
 
 ```bash
 python -m pip install -r requirements.txt
-python server.py
+python mcp_server.py
 ```
 
-Local tests: `python -m pip install pytest && python -m pytest -q`.
+Local tests: `python -m pip install -e ".[test]" && python -m pytest -q`.
 
 **Current scope:** conventional HTTP APIs, including REST, GraphQL and non-streaming model inference. No OAuth lifecycle management, HMAC/SigV4 signer, file-upload protocol, persistence, retries or long-running agent runtime.
