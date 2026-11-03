@@ -134,7 +134,7 @@ def test_mcp_tools_registered():
     from fastmcp import Client
 
     async def check():
-        async with Client(mcp) as client:
+        async with mcp._lifespan_manager(), Client(mcp) as client:
             assert client.server_info.name == "Freedo"
             assert client.server_info.version == version("freedo") == "0.3.0"
             names = {tool.name for tool in await client.list_tools()}
