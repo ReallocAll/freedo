@@ -529,7 +529,7 @@ async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
 
 @mcp.tool()
 async def get_request(task_id: str) -> ToolResult:
-    """Poll a Docket HTTP execution; TASK_NOT_FOUND means unknown outcome, not failure."""
+    """Poll a Docket HTTP execution. TASK_NOT_FOUND: retry twice total, then STOP; outcome unknown, never replay automatically."""
     docket = mcp.docket
     if docket is None:
         return ToolResult(content=_format_result({
@@ -565,8 +565,9 @@ async def get_request(task_id: str) -> ToolResult:
             "retry_after_seconds": 5, "max_additional_polls": 2,
             "do_not_resubmit_automatically": True,
             "next_action": (
-                "Retry get_request with this SAME task_id at most twice, at least 5 seconds "
-                "apart. If still missing, STOP polling and report the original HTTP outcome "
+                "After the FIRST TASK_NOT_FOUND, retry get_request with this SAME task_id "
+                "at most twice TOTAL, at least 5 seconds apart. Do not reset this budget "
+                "on another TASK_NOT_FOUND. If still missing, STOP polling and report the original HTTP outcome "
                 "as UNKNOWN. Never re-send a potentially non-idempotent request without "
                 "checking upstream state or obtaining user approval."
             ),
