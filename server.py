@@ -2,6 +2,7 @@
 
 import base64
 import codecs
+import hashlib
 import json
 import logging
 import tempfile
@@ -10,13 +11,14 @@ from datetime import timedelta
 from importlib.metadata import version
 import os
 import re
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 import httpx
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 from fastmcp_tasks import TasksExtension
+from pydantic import BaseModel, ConfigDict, Field
 
 from result_cache import MAX_STORED_BYTES, ResultCache, ResultNotFoundError, ResourceLimitError
 
@@ -29,6 +31,7 @@ MAX_LIMIT = 4 * 1024 * 1024
 MAX_TOOL_ENVELOPE = 5_500_000
 MAX_PAGE_RESPONSE_BYTES = 4 * 1024 * 1024
 DEFAULT_PAGE_BYTES = 2 * 1024 * 1024
+MAX_UPLOAD_BYTES = 512_000_000  # 512 MB, decimal; matches the ChatGPT file limit.
 AUTO_FOREGROUND_SECONDS = 15
 RESULTS = ResultCache()
 REFERENCE = re.compile(r"\{\{env:(APIKEY_[A-Za-z0-9_]+)\}\}")
@@ -40,6 +43,16 @@ DOCKET_BACKEND = os.environ.get("FASTMCP_DOCKET_URL", "memory://").split(":", 1)
 
 class FreedoError(ValueError):
     """A user-actionable error that contains no credential values."""
+
+
+class OpenAIFile(BaseModel):
+    """ChatGPT-authorized file reference provided by openai/fileParams."""
+
+    model_config = ConfigDict(extra="forbid")
+    download_url: str
+    file_id: str = Field(min_length=1)
+    mime_type: str | None = None
+    file_name: str | None = None
 
 
 def _credential(name: str) -> dict[str, str]:
@@ -302,6 +315,66 @@ def _materialize_paged(source, encoding: str, media_type: str,
         return body_format, clean.read()
 
 
+async def _send_http_request(
+    client: httpx.AsyncClient, request: httpx.Request, response_limit: int,
+    total_limit: int, include_response_headers: bool, used: set[str],
+) -> dict[str, Any]:
+    """Shared streaming response path for ordinary requests and file uploads."""
+    response = await client.send(request, stream=True)
+    try:
+        with tempfile.TemporaryFile() as output:
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > total_limit:
+                    return {
+                        "error": "response_too_large", "limit_bytes": total_limit,
+                        "status_code": response.status_code,
+                    }
+                output.write(chunk)
+
+            media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if size > response_limit:
+                body_format, safe_bytes = _materialize_paged(
+                    output, response.encoding or "utf-8", media_type, used
+                )
+                value = None
+            else:
+                output.seek(0)
+                body_format, safe_bytes, value = _safe_body(
+                    output.read(), response.encoding or "utf-8", media_type,
+                    used, parse_json=True
+                )
+        safe_headers = (_redact(dict(response.headers), used)
+                        if include_response_headers else None)
+
+        if size <= response_limit:
+            if body_format == "base64":
+                value = base64.b64encode(safe_bytes).decode("ascii")
+            elif value is None and body_format != "json":
+                value = safe_bytes.decode("utf-8")
+            elif value is None and body_format == "json":
+                # JSON null is a valid native value; distinguish it from
+                # text fallback by parsing the already sanitized document.
+                try:
+                    value = json.loads(safe_bytes)
+                except json.JSONDecodeError:
+                    body_format = "text"
+                    value = safe_bytes.decode("utf-8")
+            inline: dict[str, Any] = {
+                "status_code": response.status_code, "body": value,
+                "body_format": body_format, "size_bytes": size,
+            }
+            if safe_headers is not None:
+                inline["headers"] = safe_headers
+            if _framed_size(inline) < MAX_TOOL_ENVELOPE:
+                return inline
+        return _paged_result(response.status_code, size, body_format,
+                             safe_bytes, safe_headers)
+    finally:
+        await response.aclose()
+
+
 async def _execute_request(
     method: str,
     url: str,
@@ -366,65 +439,148 @@ async def _execute_request(
             if size > request_limit:
                 return {"error": "request_too_large", "limit_bytes": request_limit, "size_bytes": size}
 
-            response = await client.send(request, stream=True)
-            try:
-                with tempfile.TemporaryFile() as output:
-                    size = 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > total_limit:
-                            return {
-                                "error": "response_too_large", "limit_bytes": total_limit,
-                                "status_code": response.status_code,
-                            }
-                        output.write(chunk)
-
-                    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                    if size > response_limit:
-                        body_format, safe_bytes = _materialize_paged(
-                            output, response.encoding or "utf-8", media_type, used
-                        )
-                        value = None
-                    else:
-                        output.seek(0)
-                        body_format, safe_bytes, value = _safe_body(
-                            output.read(), response.encoding or "utf-8", media_type,
-                            used, parse_json=True
-                        )
-                safe_headers = (_redact(dict(response.headers), used)
-                                if include_response_headers else None)
-
-                if size <= response_limit:
-                    if body_format == "base64":
-                        value = base64.b64encode(safe_bytes).decode("ascii")
-                    elif value is None and body_format != "json":
-                        value = safe_bytes.decode("utf-8")
-                    elif value is None and body_format == "json":
-                        # JSON null is a valid native value; distinguish it from
-                        # text fallback by parsing the already sanitized document.
-                        try:
-                            value = json.loads(safe_bytes)
-                        except json.JSONDecodeError:
-                            body_format = "text"
-                            value = safe_bytes.decode("utf-8")
-                    inline: dict[str, Any] = {
-                        "status_code": response.status_code, "body": value,
-                        "body_format": body_format, "size_bytes": size,
-                    }
-                    if safe_headers is not None:
-                        inline["headers"] = safe_headers
-                    if _framed_size(inline) < MAX_TOOL_ENVELOPE:
-                        return inline
-                return _paged_result(response.status_code, size, body_format,
-                                     safe_bytes, safe_headers)
-            finally:
-                await response.aclose()
+            return await _send_http_request(
+                client, request, response_limit, total_limit, include_response_headers, used
+            )
     except FreedoError as exc:
         return {"error": "invalid_request", "detail": str(exc)}
     except (MemoryError, ResourceLimitError):
         return {"error": "resource_limit", "detail": "insufficient memory"}
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         # Exceptions can contain the expanded URL, including an API key in its path.
+        return {"error": "http_error", "type": type(exc).__name__}
+
+
+
+async def _download_attachment(
+    client: httpx.AsyncClient, file: OpenAIFile, output: BinaryIO,
+) -> tuple[int, str]:
+    """Stream the original bytes of a ChatGPT attachment into a temporary file."""
+    if httpx.URL(file.download_url).scheme != "https":
+        raise FreedoError("file.download_url must use HTTPS")
+    digest = hashlib.sha256()
+    size = 0
+    async with client.stream(
+        "GET", file.download_url, headers={"Accept-Encoding": "identity"}
+    ) as response:
+        if response.status_code in (401, 403, 404, 410):
+            raise FreedoError("FILE_AUTHORIZATION_EXPIRED")
+        if response.status_code != 200:
+            raise FreedoError("FILE_SOURCE_UNAVAILABLE")
+        declared = response.headers.get("content-length")
+        if declared is not None:
+            try:
+                announced = int(declared)
+            except ValueError as exc:
+                raise FreedoError("Invalid attachment Content-Length") from exc
+            if announced < 0 or announced > MAX_UPLOAD_BYTES:
+                raise FreedoError("file_too_large")
+        async for chunk in response.aiter_raw(chunk_size=65536):
+            if size + len(chunk) > MAX_UPLOAD_BYTES:
+                raise FreedoError("file_too_large")
+            output.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    if not size:
+        raise FreedoError("file_empty")
+    if declared is not None and size != announced:
+        raise FreedoError("file_incomplete")
+    output.seek(0)
+    return size, digest.hexdigest()
+
+
+async def _raw_file_chunks(source: BinaryIO):
+    """Stream bounded file chunks without constructing a bytes request body."""
+    while chunk := source.read(65536):
+        yield chunk
+
+
+async def _execute_upload(
+    file: dict[str, Any], method: str, url: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    mode: str = "raw",
+    field_name: str = "file",
+    form_fields: dict[str, str] | None = None,
+    filename: str | None = None,
+    content_type: str | None = None,
+    expected_sha256: str | None = None,
+    basic_auth: dict[str, str] | None = None,
+    timeout: float = 600,
+    max_response_bytes: int = DEFAULT_LIMIT,
+    include_response_headers: bool = False,
+    max_total_response_bytes: int = MAX_STORED_BYTES,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Download and forward an attachment within one Docket execution."""
+    try:
+        response_limit = _limit(max_response_bytes, "max_response_bytes")
+        total_limit = _limit(max_total_response_bytes, "max_total_response_bytes", MAX_STORED_BYTES)
+        if timeout <= 0:
+            raise FreedoError("timeout must be positive")
+        if mode not in ("raw", "multipart"):
+            raise FreedoError("mode must be raw or multipart")
+        if not field_name:
+            raise FreedoError("field_name cannot be empty")
+        if expected_sha256 is not None and not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+            raise FreedoError("expected_sha256 must be a lowercase SHA-256 hex digest")
+        if filename is not None and not filename:
+            raise FreedoError("filename cannot be empty")
+        file_ref = OpenAIFile.model_validate(file)
+        used: set[str] = set()
+        url = _inject(url, used)
+        headers = _inject(headers or {}, used)
+        params = _inject(params, used) if params is not None else None
+        form_fields = _inject(form_fields, used) if form_fields is not None else None
+        if "content-length" in {k.lower() for k in headers}:
+            raise FreedoError("Content-Length is calculated automatically for file uploads")
+        if mode == "multipart" and "content-type" in {k.lower() for k in headers}:
+            raise FreedoError("Multipart Content-Type is calculated automatically")
+        if basic_auth is not None:
+            auth = _inject(basic_auth, used)
+            if set(auth) != {"username", "password"} or "authorization" in {k.lower() for k in headers}:
+                raise FreedoError("basic_auth requires username/password and no Authorization header")
+            raw_auth = f"{auth['username']}:{auth['password']}".encode("utf-8")
+            headers["Authorization"] = "Basic " + base64.b64encode(raw_auth).decode("ascii")
+            used.add(headers["Authorization"])
+        with tempfile.TemporaryFile(mode="w+b") as temporary:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False, transport=transport,
+            ) as client:
+                size, digest = await _download_attachment(client, file_ref, temporary)
+                if expected_sha256 is not None and digest != expected_sha256:
+                    return {"error": "CONTENT_MISMATCH"}
+                effective_name = filename or file_ref.file_name or "upload"
+                media_type = content_type or file_ref.mime_type or "application/octet-stream"
+                if mode == "raw":
+                    headers.setdefault("Content-Type", media_type)
+                    headers["Content-Length"] = str(size)
+                    request = client.build_request(
+                        method, url, headers=headers, params=params,
+                        content=_raw_file_chunks(temporary),
+                    )
+                else:
+                    request = client.build_request(
+                        method, url, headers=headers, params=params,
+                        data=form_fields, files={
+                            field_name: (effective_name, temporary, media_type)
+                        },
+                    )
+                result = await _send_http_request(
+                    client, request, response_limit, total_limit,
+                    include_response_headers, used,
+                )
+                result["upload"] = {
+                    "filename": effective_name, "size_bytes": size, "sha256": digest,
+                }
+                return result
+    except FreedoError as exc:
+        return {"error": "upload_failed", "detail": str(exc)}
+    except (MemoryError, ResourceLimitError):
+        return {"error": "resource_limit", "detail": "insufficient memory"}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        # Network exception messages can contain signed URLs or credentials.
         return {"error": "http_error", "type": type(exc).__name__}
 
 
@@ -482,11 +638,16 @@ async def http_request(
     if execution == "direct":
         return ToolResult(content=_format_result(await _execute_request(*arguments)))
 
+    return await _enqueue_task(_run_background_http, arguments, execution)
+
+
+async def _enqueue_task(runner, arguments: tuple[Any, ...], execution: str) -> ToolResult:
+    """Enqueue one HTTP operation; expose a shared polling contract."""
     docket = mcp.docket
     if docket is None:
         return ToolResult(content=_format_result({"error": "background_unavailable"}))
     try:
-        execution_ref = await docket.add(_run_background_http)(arguments)
+        execution_ref = await docket.add(runner)(arguments)
     except Exception:
         return ToolResult(content=_format_result({"error": "background_schedule_failed"}))
 
@@ -525,6 +686,58 @@ async def http_request(
 async def _run_background_http(arguments: tuple[Any, ...]) -> dict[str, Any]:
     """Docket worker entrypoint; credentials are resolved only during execution."""
     return await _execute_request(*arguments)
+
+
+
+async def _run_background_upload(arguments: tuple[Any, ...]) -> dict[str, Any]:
+    """Download and forward on the same worker; never share temporary paths."""
+    return await _execute_upload(*arguments)
+
+
+@mcp.tool(meta={"openai/fileParams": ["file"]}, task=True, annotations={
+    "readOnlyHint": False, "destructiveHint": True,
+    "idempotentHint": False, "openWorldHint": True,
+})
+async def upload_file(
+    file: OpenAIFile,
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    mode: str = "raw",
+    field_name: str = "file",
+    form_fields: dict[str, str] | None = None,
+    filename: str | None = None,
+    content_type: str | None = None,
+    expected_sha256: str | None = None,
+    basic_auth: dict[str, str] | None = None,
+    timeout: float | None = None,
+    max_response_bytes: int = DEFAULT_LIMIT,
+    include_response_headers: bool = False,
+    max_total_response_bytes: int = MAX_STORED_BYTES,
+    execution: str = "auto",
+) -> ToolResult:
+    """Upload a ChatGPT attachment directly to any HTTP API (raw/multipart).
+
+    The file reference is bound by ChatGPT; no file bytes pass through MCP.
+    Downloads up to 512 MB into an automatically removed temporary file, then
+    streams it upstream without caching across Horizon instances.
+    Use {{env:APIKEY_NAME}} in the URL, headers, params, or form fields.
+    As with http_request, poll long jobs via get_request(task_id).
+    """
+    if execution not in ("auto", "direct", "background"):
+        return ToolResult(content=_format_result({
+            "error": "invalid_request", "detail": "execution must be auto, direct or background",
+        }))
+    effective_timeout = 600 if timeout is None else timeout
+    arguments = (
+        file.model_dump(), method, url, headers, params, mode, field_name, form_fields,
+        filename, content_type, expected_sha256, basic_auth, effective_timeout,
+        max_response_bytes, include_response_headers, max_total_response_bytes,
+    )
+    if execution == "direct":
+        return ToolResult(content=_format_result(await _execute_upload(*arguments)))
+    return await _enqueue_task(_run_background_upload, arguments, execution)
 
 
 @mcp.tool()
