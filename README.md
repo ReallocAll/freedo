@@ -53,6 +53,7 @@ Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
 - `http_request(method, url, ...)` sends arbitrary HTTP requests and supports `execution="auto"|"direct"|"background"`.
+- `upload_file(file, method, url, ...)` forwards a ChatGPT attachment as a raw or multipart streaming HTTP request (up to 512 MB).
 - `get_request(task_id)` polls background HTTP requests. Completed tasks return their result while retained by Docket.
 - `read_result(result_ref, offset=0, limit_bytes=2097152)` reads cached large response bodies.
 
@@ -69,6 +70,59 @@ Use a credential reference anywhere in a string value (including nested JSON val
 Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
 Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 512 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
+
+### Native ChatGPT file upload (v0.4.0)
+
+`upload_file` accepts a ChatGPT-authorized attachment through MCP
+`openai/fileParams`. The model passes a file reference, not the Base64 file
+contents. Freedo downloads the source over HTTPS into an automatically
+cleaned-up temporary file, computes SHA-256, and streams that file to the
+target HTTP API. The **512 MB limit means 512,000,000 original file bytes**,
+not a Base64 or multipart envelope limit. The source URL is a short-lived
+capability and is never returned in responses.
+
+Two modes are supported:
+
+- `mode="raw"` (default): the file becomes the exact HTTP request body. Freedo
+  determines `Content-Length`; provide any custom `Content-Type` in `headers`.
+- `mode="multipart"`: Freedo constructs a `multipart/form-data` body using
+  `field_name` (default `file`), optional `form_fields`, `filename`, and
+  `content_type`. Do not supply a manual multipart `Content-Type` header.
+
+Both modes accept `method`, `url`, `headers`, `params`, `basic_auth`,
+`timeout`, `max_response_bytes`, `max_total_response_bytes`,
+`include_response_headers`, and `execution`. Use `{{env:APIKEY_NAME}}` in
+the target URL/headers/params/form fields as with `http_request`. An optional
+`expected_sha256` verifies source bytes **before** sending the target request.
+
+Example (after selecting an attachment as the `file` tool argument):
+
+```json
+{
+  "method": "PUT",
+  "url": "https://example.test/object",
+  "mode": "raw",
+  "headers": {
+    "Authorization": "Bearer {{env:APIKEY_EXAMPLE}}",
+    "Content-Type": "application/octet-stream"
+  }
+}
+```
+
+An upload result contains the ordinary upstream HTTP response plus
+`upload.filename`, `upload.size_bytes`, and `upload.sha256`.
+`execution="auto"` uses the existing 15-second foreground window, then
+returns a task ID for `get_request`. `background` immediately returns a
+task ID; `direct` awaits completion. Uploads default to a 600-second HTTPX
+**inactivity timeout**, configurable with `timeout`. A single Docket job
+downloads and sends the file in the same process; Redis Docket shares task
+state but does not store or share temporary file data.
+
+**Scope:** This is a one-shot transfer, not a persistent `file_ref`.
+Each new upload downloads the attachment again. No automatic replay of a
+possibly successful POST/PUT on uncertain failure. The target API may impose
+its own size limits, signatures, and upload protocol. Horizon disk/network
+capacity and the complete 512 MB runtime path still need deployment testing.
 
 ### Response format (v0.2.0)
 
