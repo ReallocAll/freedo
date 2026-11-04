@@ -136,9 +136,9 @@ def test_mcp_tools_registered():
     async def check():
         async with mcp._lifespan_manager(), Client(mcp) as client:
             assert client.server_info.name == "Freedo"
-            assert client.server_info.version == version("freedo") == "0.3.0"
+            assert client.server_info.version == version("freedo") == "0.4.0"
             names = {tool.name for tool in await client.list_tools()}
-            assert names == {"list_env", "http_request", "get_request", "read_result"}
+            assert names == {"list_env", "http_request", "upload_file", "get_request", "read_result"}
             response = await client.call_tool("list_env", {})
             assert not response.is_error
             result = await client.call_tool("http_request", {
