@@ -42,7 +42,7 @@ async def test_raw_streaming_roundtrip_redacts_credentials(monkeypatch):
         if request.url.host == "chatgpt-files.test":
             assert "authorization" not in request.headers
             assert request.headers["accept-encoding"] == "identity"
-            return httpx.Response(200, content=original,
+            return httpx.Response(200, stream=httpx.ByteStream(original),
                                   headers={"Content-Length": str(len(original))})
         observed.append(request)
         assert request.method == "PUT"
@@ -135,7 +135,7 @@ async def test_checksum_mismatch_prevents_upstream_request():
 
     async def handler(request):
         paths.append(request.url.path)
-        return httpx.Response(200, content=b"source")
+        return httpx.Response(200, stream=httpx.ByteStream(b"source"))
 
     result = await server._execute_upload(
         FILE, "PUT", "https://upload.test/destination",
