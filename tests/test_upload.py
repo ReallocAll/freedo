@@ -75,7 +75,7 @@ async def test_multipart_streaming_and_form_fields(monkeypatch):
 
     async def handler(request):
         if request.url.host == "chatgpt-files.test":
-            return httpx.Response(200, content=b"\x00binary\xff")
+            return httpx.Response(200, stream=httpx.ByteStream(b"\x00binary\xff"))
         calls.append(request)
         assert request.method == "POST"
         assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
