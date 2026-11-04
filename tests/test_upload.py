@@ -130,6 +130,30 @@ async def test_limits_and_authorization_errors_do_not_upload():
 
 
 @pytest.mark.asyncio
+async def test_empty_file_is_a_valid_raw_upload():
+    calls = []
+
+    async def handler(request):
+        if request.url.host == "chatgpt-files.test":
+            return httpx.Response(
+                200, stream=httpx.ByteStream(b""), headers={"Content-Length": "0"}
+            )
+        calls.append(request.url.path)
+        assert request.headers["content-length"] == "0"
+        assert await request.aread() == b""
+        return httpx.Response(204)
+
+    result = await server._execute_upload(
+        FILE, "PUT", "https://upload.test/empty",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result["status_code"] == 204
+    assert result["upload"]["size_bytes"] == 0
+    assert result["upload"]["sha256"] == hashlib.sha256(b"").hexdigest()
+    assert calls == ["/empty"]
+
+
+@pytest.mark.asyncio
 async def test_checksum_mismatch_prevents_upstream_request():
     paths = []
 
