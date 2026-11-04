@@ -481,8 +481,6 @@ async def _download_attachment(
             output.write(chunk)
             digest.update(chunk)
             size += len(chunk)
-    if not size:
-        raise FreedoError("file_empty")
     if declared is not None and size != announced:
         raise FreedoError("file_incomplete")
     output.seek(0)
