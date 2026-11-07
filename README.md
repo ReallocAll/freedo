@@ -78,7 +78,7 @@ By default, `http_request` keeps its existing plaintext parameter format. An age
 JSON object, Base64-encoding that object and sending only:
 
 ```json
-{"base64":true,"body_base64":"eyJtZXRob2QiOiJHRVQiLCJ1cmwiOiJodHRwczovL2V4YW1wbGUudGVzdCJ9"}
+{"base64":true,"payload":"eyJtZXRob2QiOiJHRVQiLCJ1cmwiOiJodHRwczovL2V4YW1wbGUudGVzdCJ9"}
 ```
 
 The decoded example is `{"method":"GET","url":"https://example.test"}`.
@@ -95,7 +95,7 @@ request = {
     "execution": "direct",
 }
 encoded = base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii")
-# Call http_request(base64=True, body_base64=encoded)
+# Call http_request(base64=True, payload=encoded)
 ```
 
 `method`, `url`, headers, query parameters, body, timeouts, response limits and
@@ -106,9 +106,11 @@ There is **no silent fallback** to plaintext. The existing credential substituti
 request validation, background execution and plaintext response formatting remain
 unchanged.
 
-`body_base64` has two unambiguous meanings based on the `base64` flag:
-- `base64` omitted or `false`: original behavior; `body_base64` contains only the upstream HTTP request body.
-- `base64=true`: `body_base64` contains the entire serialized HTTP request; the decoded JSON may itself contain a `body_base64` field for an upstream binary body.
+`payload` is only used for the encoded **complete request** when `base64=true`.
+Do not provide `payload` when `base64` is omitted or false.
+The existing `body_base64` option **always** represents only the upstream
+HTTP request's binary body, in either mode. Encoded request JSON may contain
+a `body_base64` field if the actual upstream HTTP body is binary.
 
 Base64 is **not encryption**: anyone who sees the payload can decode it, and
 response content is still plaintext. It only prevents trivial direct keyword
