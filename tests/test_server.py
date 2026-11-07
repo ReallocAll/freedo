@@ -137,12 +137,16 @@ def test_mcp_tools_registered():
         async with mcp._lifespan_manager(), Client(mcp) as client:
             assert client.server_info.name == "Freedo"
             assert client.server_info.version == version("freedo") == "0.4.0"
-            names = {tool.name for tool in await client.list_tools()}
+            tools = await client.list_tools()
+            names = {tool.name for tool in tools}
             assert names == {"list_env", "http_request", "upload_file", "get_request", "read_result"}
+            schema = next(tool.inputSchema for tool in tools if tool.name == "http_request")
+            assert schema["properties"]["base64"]["default"] is True
+            assert schema["properties"]["json_body"]["deprecated"] is True
             response = await client.call_tool("list_env", {})
             assert not response.is_error
             result = await client.call_tool("http_request", {
-                "method": "GET", "url": "https://example.test",
+                "base64": False, "method": "GET", "url": "https://example.test",
                 "max_response_bytes": 0,
             })
             assert not result.is_error
