@@ -1,4 +1,4 @@
-"""MCP-level tests for optional Base64-wrapped HTTP requests."""
+"""MCP-level tests for default Base64-wrapped HTTP requests."""
 
 import asyncio
 import base64
@@ -50,7 +50,7 @@ async def test_base64_request_roundtrip_reuses_http_executor(monkeypatch):
     }
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         response = value(await client.call_tool("http_request", {
-            "base64": True, "payload": wrap(request),
+            "payload": wrap(request),
         }))
     assert response["status_code"] == 201
     assert response["body"] == {"message": "ok"}
@@ -108,12 +108,12 @@ async def test_base64_rejects_missing_invalid_or_mixed_input_without_http(monkey
         {"base64": True, "payload": wrap({
             "method": "GET", "url": "https://example.test",
         }), "headers": {"X-Plaintext": "leak"}},
-        {"payload": wrap({"method": "GET", "url": "https://example.test"})},
         {"base64": False, "payload": wrap({"method": "GET", "url": "https://example.test"})},
         {"base64": True, "payload": wrap({
             "method": "GET", "url": "https://example.test",
         }), "body_base64": "AP8="},
         {"method": "GET"},
+        {"method": "GET", "url": "https://example.test"},
     ]
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         for arguments in cases:
@@ -172,6 +172,7 @@ async def test_plaintext_body_base64_still_means_upstream_binary_body(monkeypatc
     monkeypatch.setattr(server, "_execute_request", mocked_execute)
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         result = value(await client.call_tool("http_request", {
+            "base64": False,
             "method": "POST", "url": "https://example.test/upload",
             "body_base64": "AP8=", "execution": "direct",
         }))
