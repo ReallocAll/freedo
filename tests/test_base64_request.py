@@ -50,7 +50,7 @@ async def test_base64_request_roundtrip_reuses_http_executor(monkeypatch):
     }
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         response = value(await client.call_tool("http_request", {
-            "base64": True, "body_base64": wrap(request),
+            "base64": True, "payload": wrap(request),
         }))
     assert response["status_code"] == 201
     assert response["body"] == {"message": "ok"}
@@ -74,7 +74,7 @@ async def test_base64_request_supports_existing_body_base64(monkeypatch):
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         response = value(await client.call_tool("http_request", {
             "base64": True,
-            "body_base64": wrap({
+            "payload": wrap({
                 "method": "POST", "url": "https://example.test/upload",
                 "body_base64": "AP8=", "execution": "direct",
             }),
@@ -94,20 +94,25 @@ async def test_base64_rejects_missing_invalid_or_mixed_input_without_http(monkey
     monkeypatch.setattr(server, "_execute_request", fake_execute)
     cases = [
         {"base64": True},
-        {"base64": True, "body_base64": "!!!"},
-        {"base64": True, "body_base64": base64.b64encode(b"\xff").decode()},
-        {"base64": True, "body_base64": base64.b64encode(b"not-json").decode()},
-        {"base64": True, "body_base64": wrap(["not", "an", "object"])},
-        {"base64": True, "body_base64": wrap({"url": "https://example.test"})},
-        {"base64": True, "body_base64": wrap({
+        {"base64": True, "payload": "!!!"},
+        {"base64": True, "payload": base64.b64encode(b"\xff").decode()},
+        {"base64": True, "payload": base64.b64encode(b"not-json").decode()},
+        {"base64": True, "payload": wrap(["not", "an", "object"])},
+        {"base64": True, "payload": wrap({"url": "https://example.test"})},
+        {"base64": True, "payload": wrap({
             "method": "GET", "url": "https://example.test", "base64": False,
         })},
-        {"base64": True, "body_base64": wrap({
+        {"base64": True, "payload": wrap({
             "method": "GET", "url": "https://example.test",
         }), "method": "GET"},
-        {"base64": True, "body_base64": wrap({
+        {"base64": True, "payload": wrap({
             "method": "GET", "url": "https://example.test",
         }), "headers": {"X-Plaintext": "leak"}},
+        {"payload": wrap({"method": "GET", "url": "https://example.test"})},
+        {"base64": False, "payload": wrap({"method": "GET", "url": "https://example.test"})},
+        {"base64": True, "payload": wrap({
+            "method": "GET", "url": "https://example.test",
+        }), "body_base64": "AP8="},
         {"method": "GET"},
     ]
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
@@ -130,7 +135,7 @@ async def test_base64_background_dispatch_preserves_execution(monkeypatch):
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         scheduled = value(await client.call_tool("http_request", {
             "base64": True,
-            "body_base64": wrap({
+            "payload": wrap({
                 "method": "GET", "url": "https://example.test",
                 "execution": "background",
             }),
