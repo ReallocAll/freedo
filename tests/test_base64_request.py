@@ -115,7 +115,7 @@ async def test_base64_rejects_missing_invalid_or_mixed_input_without_http(monkey
         for arguments in cases:
             response = value(await client.call_tool("http_request", arguments))
             assert response["error"] == "invalid_request", arguments
-            assert "payload" not in response.get("detail", "")
+            assert "example.test" not in response.get("detail", "")
     assert calls == []
 
 
