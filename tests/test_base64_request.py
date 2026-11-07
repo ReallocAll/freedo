@@ -171,4 +171,4 @@ async def test_plaintext_body_base64_still_means_upstream_binary_body(monkeypatc
             "body_base64": "AP8=", "execution": "direct",
         }))
     assert result["status_code"] == 200
-    assert seen == [b"\\x00\\xff"]
+    assert seen == [bytes([0, 255])]
