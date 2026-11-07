@@ -633,6 +633,7 @@ async def http_request(
     max_total_response_bytes: int = MAX_STORED_BYTES,
     execution: str = "auto",
     base64: bool = False,
+    payload: str | None = None,
 ) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
 
@@ -652,18 +653,18 @@ async def http_request(
     Poll background task IDs with get_request. Docket defaults to process-local
     memory; set FASTMCP_DOCKET_URL to shared Redis/Valkey for cross-instance tasks.
     The paged response cache remains process-local.
-    Set base64=true and supply only body_base64 containing the complete
-    original http_request arguments as Base64-encoded UTF-8 JSON (including
-    method, url, and optional execution). In ordinary mode, body_base64 still
-    means the upstream HTTP request body. No plaintext HTTP parameters may
-    accompany an encoded envelope. Responses remain plaintext.
+    Set base64=true and supply only payload containing the complete original
+    http_request arguments as Base64-encoded UTF-8 JSON (including method,
+    url, and optional execution). body_base64 always means the upstream
+    HTTP request body, including inside the decoded request. No plaintext
+    HTTP parameters may accompany an encoded envelope. Responses remain plaintext.
     Base64 is encoding, not encryption, and is easy for intermediaries to decode.
     """
     if base64:
         if (method is not None or url is not None
                 or any(value is not None for value in (
                     headers, params, json_body, text_body, form_body,
-                    basic_auth, timeout,
+                    body_base64, basic_auth, timeout,
                 ))
                 or max_request_bytes != DEFAULT_LIMIT
                 or max_response_bytes != DEFAULT_LIMIT
@@ -672,14 +673,14 @@ async def http_request(
                 or execution != "auto"):
             return ToolResult(content=_format_result({
                 "error": "invalid_request",
-                "detail": "base64=true requires body_base64 only; omit plaintext HTTP arguments",
+                "detail": "base64=true requires payload only; omit plaintext HTTP arguments",
             }))
-        if body_base64 is None:
+        if payload is None:
             return ToolResult(content=_format_result({
-                "error": "invalid_request", "detail": "base64=true requires body_base64",
+                "error": "invalid_request", "detail": "base64=true requires payload",
             }))
         try:
-            decoded = _decode_http_payload(body_base64)
+            decoded = _decode_http_payload(payload)
         except FreedoError as exc:
             return ToolResult(content=_format_result({
                 "error": "invalid_request", "detail": str(exc),
@@ -691,6 +692,10 @@ async def http_request(
         max_request_bytes, max_response_bytes = decoded.max_request_bytes, decoded.max_response_bytes
         include_response_headers = decoded.include_response_headers
         max_total_response_bytes, execution = decoded.max_total_response_bytes, decoded.execution
+    elif payload is not None:
+        return ToolResult(content=_format_result({
+            "error": "invalid_request", "detail": "payload requires base64=true",
+        }))
     if not method or not url:
         return ToolResult(content=_format_result({
             "error": "invalid_request", "detail": "method and url are required",
