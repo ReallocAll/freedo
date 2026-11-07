@@ -18,7 +18,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 from fastmcp_tasks import TasksExtension
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from result_cache import MAX_STORED_BYTES, ResultCache, ResultNotFoundError, ResourceLimitError
 
@@ -582,13 +582,43 @@ async def _execute_upload(
         return {"error": "http_error", "type": type(exc).__name__}
 
 
+class HttpRequestPayload(BaseModel):
+    """Original http_request parameters represented inside a Base64 JSON envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+    method: str
+    url: str
+    headers: dict[str, str] | None = None
+    params: dict[str, Any] | None = None
+    json_body: dict[str, Any] | list[Any] | None = None
+    text_body: str | None = None
+    form_body: dict[str, str] | None = None
+    body_base64: str | None = None
+    basic_auth: dict[str, str] | None = None
+    timeout: float | None = None
+    max_request_bytes: int = DEFAULT_LIMIT
+    max_response_bytes: int = DEFAULT_LIMIT
+    include_response_headers: bool = False
+    max_total_response_bytes: int = MAX_STORED_BYTES
+    execution: str = "auto"
+
+
+def _decode_http_payload(payload: str) -> HttpRequestPayload:
+    """Parse a Base64-wrapped request without exposing its contents in errors."""
+    try:
+        raw = base64.b64decode(payload, validate=True)
+        return HttpRequestPayload.model_validate(json.loads(raw.decode("utf-8")))
+    except (ValueError, UnicodeError, base64.binascii.Error, ValidationError) as exc:
+        raise FreedoError("payload must be Base64-encoded UTF-8 JSON with valid http_request arguments") from exc
+
+
 @mcp.tool(task=True, annotations={
     "readOnlyHint": False, "destructiveHint": True,
     "idempotentHint": False, "openWorldHint": True,
 })
 async def http_request(
-    method: str,
-    url: str,
+    method: str | None = None,
+    url: str | None = None,
     headers: dict[str, str] | None = None,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | list[Any] | None = None,
@@ -602,6 +632,8 @@ async def http_request(
     include_response_headers: bool = False,
     max_total_response_bytes: int = MAX_STORED_BYTES,
     execution: str = "auto",
+    base64: bool = False,
+    payload: str | None = None,
 ) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
 
@@ -621,7 +653,53 @@ async def http_request(
     Poll background task IDs with get_request. Docket defaults to process-local
     memory; set FASTMCP_DOCKET_URL to shared Redis/Valkey for cross-instance tasks.
     The paged response cache remains process-local.
+    Set base64=true and supply only payload containing the complete original
+    http_request arguments as Base64-encoded UTF-8 JSON (including method,
+    url, and optional execution). body_base64 always means the upstream
+    HTTP request body, including inside the decoded request. No plaintext
+    HTTP parameters may accompany an encoded envelope. Responses remain plaintext.
+    Base64 is encoding, not encryption, and is easy for intermediaries to decode.
     """
+    if base64:
+        if (method is not None or url is not None
+                or any(value is not None for value in (
+                    headers, params, json_body, text_body, form_body,
+                    body_base64, basic_auth, timeout,
+                ))
+                or max_request_bytes != DEFAULT_LIMIT
+                or max_response_bytes != DEFAULT_LIMIT
+                or include_response_headers
+                or max_total_response_bytes != MAX_STORED_BYTES
+                or execution != "auto"):
+            return ToolResult(content=_format_result({
+                "error": "invalid_request",
+                "detail": "base64=true requires payload only; omit plaintext HTTP arguments",
+            }))
+        if payload is None:
+            return ToolResult(content=_format_result({
+                "error": "invalid_request", "detail": "base64=true requires payload",
+            }))
+        try:
+            decoded = _decode_http_payload(payload)
+        except FreedoError as exc:
+            return ToolResult(content=_format_result({
+                "error": "invalid_request", "detail": str(exc),
+            }))
+        method, url = decoded.method, decoded.url
+        headers, params, json_body = decoded.headers, decoded.params, decoded.json_body
+        text_body, form_body, body_base64 = decoded.text_body, decoded.form_body, decoded.body_base64
+        basic_auth, timeout = decoded.basic_auth, decoded.timeout
+        max_request_bytes, max_response_bytes = decoded.max_request_bytes, decoded.max_response_bytes
+        include_response_headers = decoded.include_response_headers
+        max_total_response_bytes, execution = decoded.max_total_response_bytes, decoded.execution
+    elif payload is not None:
+        return ToolResult(content=_format_result({
+            "error": "invalid_request", "detail": "payload requires base64=true",
+        }))
+    if not method or not url:
+        return ToolResult(content=_format_result({
+            "error": "invalid_request", "detail": "method and url are required",
+        }))
     if execution not in ("auto", "direct", "background"):
         return ToolResult(content=_format_result({
             "error": "invalid_request",
