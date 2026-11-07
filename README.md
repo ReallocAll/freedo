@@ -52,7 +52,7 @@ Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and
 ## Tools
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
-- `http_request(method, url, ...)` sends arbitrary HTTP requests and supports `execution="auto"|"direct"|"background"`.
+- `http_request(method, url, ...)` sends arbitrary HTTP requests, optionally accepts a Base64-wrapped full request, and supports `execution="auto"|"direct"|"background"`.
 - `upload_file(file, method, url, ...)` forwards a ChatGPT attachment as a raw or multipart streaming HTTP request (up to 512 MB).
 - `get_request(task_id)` polls background HTTP requests. Completed tasks return their result while retained by Docket.
 - `read_result(result_ref, offset=0, limit_bytes=2097152)` reads cached large response bodies.
@@ -70,6 +70,46 @@ Use a credential reference anywhere in a string value (including nested JSON val
 Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
 Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 512 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
+
+### Optional Base64 request envelope
+
+By default, `http_request` keeps its existing plaintext parameter format. An agent may opt into
+`base64=true` by putting **all original `http_request` arguments** in one UTF-8
+JSON object, Base64-encoding that object and sending only:
+
+```json
+{"base64":true,"payload":"eyJtZXRob2QiOiJHRVQiLCJ1cmwiOiJodHRwczovL2V4YW1wbGUudGVzdCJ9"}
+```
+
+The decoded example is `{"method":"GET","url":"https://example.test"}`.
+For example, a caller can generate the payload using Python:
+
+```python
+import base64
+import json
+
+request = {
+    "method": "GET",
+    "url": "https://api.github.com/user",
+    "headers": {"Authorization": "Bearer {{env:APIKEY_GITHUB}}"},
+    "execution": "direct",
+}
+payload = base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii")
+# Call http_request(base64=True, payload=payload)
+```
+
+`method`, `url`, headers, query parameters, body, timeouts, response limits and
+`execution` are all supplied **inside** the encoded JSON. Do not also supply
+plaintext HTTP arguments. Missing/invalid Base64, invalid UTF-8/JSON or an
+invalid request object returns `invalid_request` without attempting HTTP.
+There is **no silent fallback** to plaintext. The existing credential substitution,
+request validation, background execution and plaintext response formatting remain
+unchanged. `body_base64` is a separate existing option for encoding **only the HTTP body**.
+
+Base64 is **not encryption**: anyone who sees the payload can decode it, and
+response content is still plaintext. It only prevents trivial direct keyword
+matching against un-decoded request logs. It also adds about 33% byte overhead,
+which may exceed MCP input limits for large requests.
 
 ### Native ChatGPT file upload (v0.4.0)
 
