@@ -50,7 +50,7 @@ async def test_base64_request_roundtrip_reuses_http_executor(monkeypatch):
     }
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         response = value(await client.call_tool("http_request", {
-            "base64": True, "payload": wrap(request),
+            "base64": True, "body_base64": wrap(request),
         }))
     assert response["status_code"] == 201
     assert response["body"] == {"message": "ok"}
@@ -74,7 +74,7 @@ async def test_base64_request_supports_existing_body_base64(monkeypatch):
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         response = value(await client.call_tool("http_request", {
             "base64": True,
-            "payload": wrap({
+            "body_base64": wrap({
                 "method": "POST", "url": "https://example.test/upload",
                 "body_base64": "AP8=", "execution": "direct",
             }),
@@ -94,21 +94,20 @@ async def test_base64_rejects_missing_invalid_or_mixed_input_without_http(monkey
     monkeypatch.setattr(server, "_execute_request", fake_execute)
     cases = [
         {"base64": True},
-        {"base64": True, "payload": "!!!"},
-        {"base64": True, "payload": base64.b64encode(b"\xff").decode()},
-        {"base64": True, "payload": base64.b64encode(b"not-json").decode()},
-        {"base64": True, "payload": wrap(["not", "an", "object"])},
-        {"base64": True, "payload": wrap({"url": "https://example.test"})},
-        {"base64": True, "payload": wrap({
+        {"base64": True, "body_base64": "!!!"},
+        {"base64": True, "body_base64": base64.b64encode(b"\xff").decode()},
+        {"base64": True, "body_base64": base64.b64encode(b"not-json").decode()},
+        {"base64": True, "body_base64": wrap(["not", "an", "object"])},
+        {"base64": True, "body_base64": wrap({"url": "https://example.test"})},
+        {"base64": True, "body_base64": wrap({
             "method": "GET", "url": "https://example.test", "base64": False,
         })},
-        {"base64": True, "payload": wrap({
+        {"base64": True, "body_base64": wrap({
             "method": "GET", "url": "https://example.test",
         }), "method": "GET"},
-        {"base64": True, "payload": wrap({
+        {"base64": True, "body_base64": wrap({
             "method": "GET", "url": "https://example.test",
         }), "headers": {"X-Plaintext": "leak"}},
-        {"payload": wrap({"method": "GET", "url": "https://example.test"})},
         {"method": "GET"},
     ]
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
@@ -131,7 +130,7 @@ async def test_base64_background_dispatch_preserves_execution(monkeypatch):
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         scheduled = value(await client.call_tool("http_request", {
             "base64": True,
-            "payload": wrap({
+            "body_base64": wrap({
                 "method": "GET", "url": "https://example.test",
                 "execution": "background",
             }),
@@ -150,3 +149,26 @@ async def test_base64_background_dispatch_preserves_execution(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0:2] == ("GET", "https://example.test")
     assert calls[0][9] == 600
+
+
+@pytest.mark.asyncio
+async def test_plaintext_body_base64_still_means_upstream_binary_body(monkeypatch):
+    seen = []
+
+    def handle(request):
+        seen.append(request.content)
+        return httpx.Response(200, text="ok")
+
+    actual_execute = server._execute_request
+
+    async def mocked_execute(*args):
+        return await actual_execute(*args, transport=httpx.MockTransport(handle))
+
+    monkeypatch.setattr(server, "_execute_request", mocked_execute)
+    async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
+        result = value(await client.call_tool("http_request", {
+            "method": "POST", "url": "https://example.test/upload",
+            "body_base64": "AP8=", "execution": "direct",
+        }))
+    assert result["status_code"] == 200
+    assert seen == [b"\\x00\\xff"]
