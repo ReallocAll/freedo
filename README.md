@@ -27,7 +27,7 @@ Configure Horizon variable **APIKEY_GITHUB** with a GitHub token and description
 {"key":"ghp_your_token","desc":"GitHub REST https://api.github.com; docs https://docs.github.com/en/rest and https://docs.github.com/en/graphql; credential has the scopes I granted."}
 ```
 
-The tool does not contain GitHub-specific code. Agents should obtain exact paths, request fields and permission requirements from the official API documentation.
+The tool does not contain GitHub-specific code. Agents should obtain exact paths, request fields and permission requirements from the official API documentation. The following examples show **decoded request objects**, not direct tool arguments: encode the complete object into `payload` as described below.
 
 REST authenticated identity:
 
@@ -38,13 +38,13 @@ REST authenticated identity:
 GraphQL:
 
 ```json
-{"method":"POST","url":"https://api.github.com/graphql","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}"},"json_body":{"query":"query { viewer { login } }"}}
+{"method":"POST","url":"https://api.github.com/graphql","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}","Content-Type":"application/json"},"text_body":"{\"query\":\"query { viewer { login } }\"}"}
 ```
 
 Trigger a GitHub Actions workflow (write operation, subject to token permissions):
 
 ```json
-{"method":"POST","url":"https://api.github.com/repos/OWNER/REPO/actions/workflows/WORKFLOW_ID/dispatches","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}"},"json_body":{"ref":"main"}}
+{"method":"POST","url":"https://api.github.com/repos/OWNER/REPO/actions/workflows/WORKFLOW_ID/dispatches","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}","Content-Type":"application/json"},"text_body":"{\"ref\":\"main\"}"}
 ```
 
 Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and an explicit credential reference. Other API providers work exactly the same way. GitHub remains the first integration/test target, **not** an internal provider dependency.
@@ -52,7 +52,7 @@ Unlike the retiring GitHub-specific MCP, Freedo uses a complete upstream URL and
 ## Tools
 
 - `list_env()` lists configured `APIKEY_*` names and optional descriptions. Secret values are never returned.
-- `http_request(method, url, ...)` sends arbitrary HTTP requests, optionally accepts a Base64-wrapped full request, and supports `execution="auto"|"direct"|"background"`.
+- `http_request(payload, base64=true)` sends arbitrary HTTP requests using a Base64-wrapped full request by default; legacy plaintext arguments require `base64=false`. Supports `execution="auto"|"direct"|"background"` inside the encoded request.
 - `upload_file(file, method, url, ...)` forwards a ChatGPT attachment as a raw or multipart streaming HTTP request (up to 512 MB).
 - `get_request(task_id)` polls background HTTP requests. Completed tasks return their result while retained by Docket.
 - `read_result(result_ref, offset=0, limit_bytes=2097152)` reads cached large response bodies.
@@ -67,22 +67,22 @@ Use a credential reference anywhere in a string value (including nested JSON val
 }
 ```
 
-Supported request options: `headers`, `params`, one of `json_body` / `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
+Supported request options (inside `payload` by default): `method`, `url`, `headers`, `params`, one of `text_body` / `form_body` / `body_base64`, optional `basic_auth` (`username`, `password`), `timeout`, `max_request_bytes`, `max_response_bytes`, `max_total_response_bytes`, `execution`, `include_response_headers` (default `false`). `json_body` is **deprecated** in the MCP tool schema but still accepted for compatibility (including inside encoded requests). For JSON bodies, prefer `text_body` with `Content-Type: application/json`. For Basic Auth, put the credential reference in `basic_auth.password`; Freedo constructs the standard Basic header.
 
 Request body size defaults to 2 MiB (maximum 4 MiB); it is measured after credential substitution and encoding. `max_response_bytes` now controls the **inline response threshold** (default 2 MiB; maximum 4 MiB), not the total upstream response cap. Upstream responses may total 512 MiB by default (`max_total_response_bytes`, configurable downward). Large responses are retained for `read_result` rather than returned partially or rejected because they exceed the inline threshold. A response exceeding the total limit still returns `response_too_large`. Binary pages use Base64; all page responses are bounded by the serialized MCP size.
 
-### Optional Base64 request envelope
+### Base64 request envelope (default)
 
-By default, `http_request` keeps its existing plaintext parameter format. An agent may opt into
-`base64=true` by putting **all original `http_request` arguments** in one UTF-8
-JSON object, Base64-encoding that object and sending only:
+By default, `http_request` uses `base64=true`. Encode **all original HTTP request
+arguments** as a UTF-8 JSON object and send only the encoded `payload`:
 
 ```json
-{"base64":true,"payload":"eyJtZXRob2QiOiJHRVQiLCJ1cmwiOiJodHRwczovL2V4YW1wbGUudGVzdCJ9"}
+{"payload":"eyJtZXRob2QiOiJHRVQiLCJ1cmwiOiJodHRwczovL2V4YW1wbGUudGVzdCJ9"}
 ```
 
 The decoded example is `{"method":"GET","url":"https://example.test"}`.
-For example, a caller can generate the encoded request using Python:
+The `base64` flag may be omitted because its default is `true`.
+For example, to build a request dynamically:
 
 ```python
 import base64
@@ -94,28 +94,37 @@ request = {
     "headers": {"Authorization": "Bearer {{env:APIKEY_GITHUB}}"},
     "execution": "direct",
 }
-encoded = base64.b64encode(json.dumps(request).encode("utf-8")).decode("ascii")
-# Call http_request(base64=True, payload=encoded)
+encoded = base64.b64encode(
+    json.dumps(request, ensure_ascii=False).encode("utf-8")
+).decode("ascii")
+# Call http_request(payload=encoded) -- base64=True by default.
 ```
 
 `method`, `url`, headers, query parameters, body, timeouts, response limits and
-`execution` are all supplied **inside** the encoded JSON. Do not also supply
-plaintext HTTP arguments. Missing/invalid Base64, invalid UTF-8/JSON or an
-invalid request object returns `invalid_request` without attempting HTTP.
-There is **no silent fallback** to plaintext. The existing credential substitution,
-request validation, background execution and plaintext response formatting remain
-unchanged.
+`execution` belong **inside** the encoded JSON. Do not also supply plaintext
+HTTP arguments. Missing or invalid Base64, invalid UTF-8/JSON, or an invalid
+request object returns `invalid_request` without attempting HTTP. There is
+**no silent fallback** to plaintext.
 
-`payload` is only used for the encoded **complete request** when `base64=true`.
-Do not provide `payload` when `base64` is omitted or false.
-The existing `body_base64` option **always** represents only the upstream
-HTTP request's binary body, in either mode. Encoded request JSON may contain
-a `body_base64` field if the actual upstream HTTP body is binary.
+To use the legacy plaintext parameter format, explicitly pass `base64=false`
+and omit `payload`:
 
-Base64 is **not encryption**: anyone who sees the payload can decode it, and
-response content is still plaintext. It only prevents trivial direct keyword
-matching against un-decoded request logs. It also adds about 33% byte overhead,
-which may exceed MCP input limits for large requests.
+```json
+{"base64":false,"method":"GET","url":"https://api.github.com/user","headers":{"Authorization":"Bearer {{env:APIKEY_GITHUB}}"}}
+```
+
+`json_body` remains usable but is marked **deprecated** in the MCP tool schema.
+Prefer `text_body` with an appropriate `Content-Type` for JSON; `body_base64`
+always represents only the upstream HTTP request's binary body, in either
+mode. An encoded request can contain `text_body`, `body_base64`, or even
+deprecated `json_body`.
+
+The existing credential substitution, request validation, background execution
+and plaintext response formatting are unchanged. Base64 is **not encryption**:
+anyone who sees the payload can decode it, and response content is still plaintext.
+It only prevents trivial direct keyword matching against un-decoded request logs.
+It also adds about 33% byte overhead, which may exceed MCP input limits for
+large requests.
 
 ### Native ChatGPT file upload (v0.4.0)
 
