@@ -11,7 +11,7 @@ from datetime import timedelta
 from importlib.metadata import version
 import os
 import re
-from typing import Any, BinaryIO
+from typing import Annotated, Any, BinaryIO
 from uuid import uuid4
 
 import httpx
@@ -621,7 +621,10 @@ async def http_request(
     url: str | None = None,
     headers: dict[str, str] | None = None,
     params: dict[str, Any] | None = None,
-    json_body: dict[str, Any] | list[Any] | None = None,
+    json_body: Annotated[
+        dict[str, Any] | list[Any] | None,
+        Field(deprecated=True, description="Deprecated; use text_body or body_base64 for the upstream HTTP body."),
+    ] = None,
     text_body: str | None = None,
     form_body: dict[str, str] | None = None,
     body_base64: str | None = None,
@@ -632,7 +635,7 @@ async def http_request(
     include_response_headers: bool = False,
     max_total_response_bytes: int = MAX_STORED_BYTES,
     execution: str = "auto",
-    base64: bool = False,
+    base64: bool = True,
     payload: str | None = None,
 ) -> ToolResult:
     """Make any HTTP request. Use {{env:APIKEY_NAME}} in URL, headers, query or body.
@@ -640,7 +643,8 @@ async def http_request(
     Consult list_env to discover configured credentials. Construct service-specific
     URLs, HTTP methods and auth headers using the provider's official API docs.
     basic_auth accepts username/password strings with the same reference syntax.
-    Bodies are mutually exclusive: json_body, text_body, form_body or body_base64.
+    Bodies are mutually exclusive: text_body, form_body, body_base64 or
+    deprecated json_body (retained for compatibility).
     Response is a single JSON text item with status_code, body, body_format
     (json/text/base64), and size_bytes. JSON media types return native JSON
     values; malformed JSON falls back to text. Use include_response_headers
@@ -653,11 +657,12 @@ async def http_request(
     Poll background task IDs with get_request. Docket defaults to process-local
     memory; set FASTMCP_DOCKET_URL to shared Redis/Valkey for cross-instance tasks.
     The paged response cache remains process-local.
-    Set base64=true and supply only payload containing the complete original
-    http_request arguments as Base64-encoded UTF-8 JSON (including method,
-    url, and optional execution). body_base64 always means the upstream
-    HTTP request body, including inside the decoded request. No plaintext
-    HTTP parameters may accompany an encoded envelope. Responses remain plaintext.
+    By default base64=true: supply only payload, containing all HTTP request
+    arguments as Base64-encoded UTF-8 JSON (including method, url and execution).
+    For legacy plaintext calls, explicitly set base64=false and omit payload.
+    body_base64 always means the upstream HTTP request body, including inside
+    the decoded request. No plaintext HTTP parameters may accompany an encoded
+    envelope. Responses remain plaintext.
     Base64 is encoding, not encryption, and is easy for intermediaries to decode.
     """
     if base64:
