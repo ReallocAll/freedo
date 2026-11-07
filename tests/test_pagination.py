@@ -130,7 +130,7 @@ async def test_auto_detaches_same_request_without_retry(monkeypatch):
     monkeypatch.setattr(server, "_execute_request", fake_execute)
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         first = await client.call_tool("http_request", {
-            "method": "POST", "url": "https://example.test", "execution": "auto",
+            "base64": False, "method": "POST", "url": "https://example.test", "execution": "auto",
         })
         payload = json.loads(first.content[0].text)
         assert payload["status"] == "working" and payload["task_id"]
@@ -154,11 +154,11 @@ async def test_direct_is_inline_with_60_second_timeout(monkeypatch):
     monkeypatch.setattr(server, "_execute_request", fake_execute)
     async with server.mcp._lifespan_manager(), Client(server.mcp) as client:
         result = await client.call_tool("http_request", {
-            "method": "GET", "url": "https://example.test", "execution": "direct",
+            "base64": False, "method": "GET", "url": "https://example.test", "execution": "direct",
         })
         assert json.loads(result.content[0].text)["body"] == "ok"
         result = await client.call_tool("http_request", {
-            "method": "GET", "url": "https://example.test", "execution": "background",
+            "base64": False, "method": "GET", "url": "https://example.test", "execution": "background",
         })
         task_id = json.loads(result.content[0].text)["task_id"]
         done = await _poll_until_done(client, task_id)
